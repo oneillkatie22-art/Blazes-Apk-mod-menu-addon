@@ -25,6 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
+#define CDB_VERSION "v1.2.0"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -368,6 +369,7 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
 static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
+static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_bigHands;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
@@ -400,6 +402,7 @@ static void ApplyGravity();
 static void DancePicked();
 static void ArmDupe9();
 static void ArmDupe27();
+static void ArmDupe9x3();
 static bool LeftHandItem();
 static void ScanSongs();
 static void PlaySong();
@@ -409,10 +412,15 @@ static void StopSound();
 static void ApplyLoop();
 static void NextSoundVolume();
 static void WeatherPicked();
+static void LongArmsToggled();
+static void NextArmLength();
+static void NextJumpPower();
+static void ApplyBigHands();
+static void OverpoweredOff();
 static void NextWeatherIntensity();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, SETTINGS, ENABLED, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Settings", "Enabled Mods"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -430,6 +438,7 @@ static Item g_items[] = {
     {MAIN, "Items", OPEN, ITEMS},
     {MAIN, "Soundboard", OPEN, SOUNDBOARD},
     {MAIN, "Effects", OPEN, EFFECTS},
+    {MAIN, "Overpowered", OPEN, OVERPOWERED},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
@@ -462,6 +471,7 @@ static Item g_items[] = {
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
+    {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
 
     {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
@@ -478,6 +488,19 @@ static Item g_items[] = {
     {EFFECTS, "Rain", TOGGLE, MAIN, &g_wxSel[1], WeatherPicked},
     {EFFECTS, "Thunderstorm", TOGGLE, MAIN, &g_wxSel[2], WeatherPicked},
     {EFFECTS, "Effect Intensity", ACTION, MAIN, nullptr, NextWeatherIntensity},
+
+    {OVERPOWERED, "Exit Overpowered", OPEN, MAIN},
+    {OVERPOWERED, "Very Long Arms", TOGGLE, MAIN, &f_longArms, LongArmsToggled},
+    {OVERPOWERED, "Arm Length", ACTION, MAIN, nullptr, NextArmLength},
+    {OVERPOWERED, "Super Speed", TOGGLE, MAIN, &f_superSpeed, ApplySpeedBoost},
+    {OVERPOWERED, "Mega Jump", TOGGLE, MAIN, &f_megaJump},
+    {OVERPOWERED, "Jump Power", ACTION, MAIN, nullptr, NextJumpPower},
+    {OVERPOWERED, "Super Fly", TOGGLE, MAIN, &f_superFly},
+    {OVERPOWERED, "Rocket Boots", TOGGLE, MAIN, &f_rocket},
+    {OVERPOWERED, "Grapple Hook", TOGGLE, MAIN, &f_grapple},
+    {OVERPOWERED, "Ground Pound", TOGGLE, MAIN, &f_groundPound},
+    {OVERPOWERED, "Big Hands", TOGGLE, MAIN, &f_bigHands, ApplyBigHands},
+    {OVERPOWERED, "Turn Overpowered Off", ACTION, MAIN, nullptr, OverpoweredOff},
 
     {SETTINGS, "Exit Settings", OPEN, MAIN},
     {SETTINGS, "Change Pointer Position", ACTION, MAIN, nullptr, NextPointer},
@@ -522,6 +545,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Spawn Item Gun", "Hold an item in your left hand. Right grip aims, trigger spawns it."},
     {"Duplicate Items (3x3)", "9 of the item in your left hand appear in front of you."},
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
+    {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
     {"Helicopter", "Both arms spin around you. Hold left trigger."},
@@ -543,6 +567,18 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Rain", "Rain falls around you."},
     {"Thunderstorm", "Rain with lightning and thunder."},
     {"Effect Intensity", "Light, medium or heavy."},
+    {"Overpowered", "The overpowered mods. Two pages."},
+    {"Very Long Arms", "Your arms reach a long way. Hands go normal while the menu is open."},
+    {"Arm Length", "How long the arms are: 4x, 6x, 8x or 12x."},
+    {"Super Speed", "A lot faster and higher jumps than Speed Boost."},
+    {"Mega Jump", "Press B for a huge jump, even in the air. (Y with the right hand menu.)"},
+    {"Jump Power", "Small, medium, big or huge jump."},
+    {"Super Fly", "Hold A to rocket where you look."},
+    {"Rocket Boots", "Hold both triggers to shoot upward."},
+    {"Grapple Hook", "Hold left trigger to swing toward what you point at."},
+    {"Ground Pound", "Press both grips to slam down."},
+    {"Big Hands", "Your hands get a lot bigger. Held items grow too."},
+    {"Turn Overpowered Off", "Switches every Overpowered mod off."},
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
@@ -770,9 +806,7 @@ static void BuildMenu() {
         Label(ct, "<", Vector3(-kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, "", Vector3(0, -kBoardH / 2 - 0.05f, 0), kBoardW, 0.03f, 17, &g_tipText);
-        char ver[64];
-        snprintf(ver, sizeof ver, "ClientDaBell build %s", ym::api()->gameVersion);
-        Label(ct, ver, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
+        Label(ct, CDB_VERSION, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
     }
     BuildDecor(bt);
     // Pointer: a small ball on the index finger of the other hand
@@ -1132,21 +1166,30 @@ static float g_oldJumpSpeed = 0, g_oldJumpMultiplier = 0;
 static Il2CppObject *g_boosted = nullptr;      // which player has the boost (compared only)
 static bool g_gravityOff = false;
 
+static int g_boostLevel = 0;                   // 1 = Speed Boost, 2 = Super Speed
 static void ApplySpeedBoost() {
     Il2CppObject *player = g_player.get();
     bool ok = G.maxJumpSpeed.IsValid() && G.jumpMultiplier.IsValid();
-    if (f_speedBoost && ok && player && g_boosted != player) {
-        g_oldJumpSpeed = G.maxJumpSpeed[player]();
-        g_oldJumpMultiplier = G.jumpMultiplier[player]();
-        G.maxJumpSpeed[player] = 9.0f;
-        G.jumpMultiplier[player] = 1.5f;
-        g_boosted = player;
-    } else if (!f_speedBoost && g_boosted) {
+    int level = f_superSpeed ? 2 : f_speedBoost ? 1 : 0;
+    if (level && ok && player) {
+        if (g_boosted != player) {                 // first time on this player: remember the normal values
+            g_oldJumpSpeed = G.maxJumpSpeed[player]();
+            g_oldJumpMultiplier = G.jumpMultiplier[player]();
+            g_boosted = player;
+            g_boostLevel = 0;
+        }
+        if (g_boostLevel != level) {
+            G.maxJumpSpeed[player] = level == 2 ? 20.0f : 9.0f;
+            G.jumpMultiplier[player] = level == 2 ? 3.0f : 1.5f;
+            g_boostLevel = level;
+        }
+    } else if (!level && g_boosted) {
         if (ok && player == g_boosted) {
             G.maxJumpSpeed[player] = g_oldJumpSpeed;
             G.jumpMultiplier[player] = g_oldJumpMultiplier;
         }
         g_boosted = nullptr;
+        g_boostLevel = 0;
     }
 }
 
@@ -1499,19 +1542,21 @@ static void ItemQueueTick() {
     }
 }
 
-// The grid in front of you: 3 across, 3 deep, and 3 high for 3x3x3.
-static void SpawnGrid(int count) {
+// A grid in front of you: w across, d deep, h high. Never more than 27 in one batch (AGENTS.md),
+// and QueueItems adds the 3 second cooldown and the cap on how many wait.
+static void SpawnGridDims(int w, int d, int h) {
     Il2CppObject *head = g_head.get();
-    if (!head) return;
+    if (!head || w < 1 || d < 1 || h < 1 || w * d * h > 27) return;
     Vector3 f = Flat(G.trGetForward[head]()), r = Cross(Vector3(0, 1, 0), f);
     Vector3 base = G.trGetPosition[head]() + f * 1.2f + Vector3(0, -0.4f, 0);
     std::vector<PendingItem> list;
-    for (int y = 0; y < (count > 9 ? 3 : 1); y++)
-        for (int z = 0; z < 3; z++)
-            for (int x = 0; x < 3; x++)
-                list.push_back({base + r * ((x - 1) * 0.45f) + f * (z * 0.45f) + Vector3(0, y * 0.45f, 0), Vector3(0, 0, 0)});
+    for (int y = 0; y < h; y++)
+        for (int z = 0; z < d; z++)
+            for (int x = 0; x < w; x++)
+                list.push_back({base + r * ((x - (w - 1) * 0.5f) * 0.45f) + f * (z * 0.45f) + Vector3(0, y * 0.45f, 0), Vector3(0, 0, 0)});
     QueueItems(list);
 }
+static void SpawnGrid(int count) { SpawnGridDims(3, 3, count > 9 ? 3 : 1); }   // 3x3 or 3x3x3
 // The item you're holding in your LEFT hand right now (owner 2026-10-31: items spawn as
 // whatever is in your left hand when you press). One scene search per press.
 static bool LeftHandItem() {
@@ -1537,6 +1582,7 @@ static bool LeftHandItem() {
 }
 static void ArmDupe9() { if (LeftHandItem()) SpawnGrid(9); }
 static void ArmDupe27() { if (LeftHandItem()) SpawnGrid(27); }
+static void ArmDupe9x3() { if (LeftHandItem()) SpawnGridDims(9, 3, 1); }   // 27 in a row of 9, three deep
 
 // Spawn On Hand: each right-trigger press (grip open) spawns the item at your hand.
 static bool g_onHandTrigger = false;
@@ -2043,6 +2089,237 @@ static void WeatherTick(float dt) {
     else { HideBolt(); g_nextBolt = 0; }
 }
 
+// ---- Overpowered (all of it changes only your own body; nothing is sent) ---------------
+// Very Long Arms moves your own hands, like the dances do, so the room sees the long arms
+// the way it sees any pose: the game sends your hands as usual and nothing extra goes out.
+static const float kArmScales[] = {4.0f, 6.0f, 8.0f, 12.0f};
+static int g_armScale = 2;
+static void NextArmLength() { g_armScale = (g_armScale + 1) % 4; Notify("Arm length: %dx", (int)kArmScales[g_armScale]); }
+
+// To stretch an arm the controller trackers have to be paused (they would put the hand back),
+// so the real controller position is read from the headset's input instead. That position is
+// in the space of one of the hand's parents; the first frames check which one by comparing
+// with where the hand really is. If nothing matches, Very Long Arms switches itself off.
+static int g_laState = 0;                      // 0 starting, 1 checking, 2 working, 3 not supported
+static int g_laChecks = 0, g_laSpaceL = -1, g_laSpaceR = -1;
+static bool g_laOwns = false, g_laInit = false;
+static double g_laNextPause = 0;
+static Method<bool> g_tryVec3, g_tryQuat;
+static Ref g_usagePos, g_usageRot;
+static void LongArmsToggled() { g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; }
+
+static bool LaInit() {
+    if (g_laInit) return g_tryVec3.IsValid() && g_tryQuat.IsValid();
+    g_laInit = true;
+    Class dev("UnityEngine.XR", "InputDevices");
+    if (!dev.IsValid()) return false;
+    g_tryVec3 = dev.GetMethod("TryGetFeatureValue_Vector3", 3);
+    g_tryQuat = dev.GetMethod("TryGetFeatureValue_Quaternion", 3);
+    g_usagePos.set((Il2CppObject *)CreateMonoString("DevicePosition"));
+    g_usageRot.set((Il2CppObject *)CreateMonoString("DeviceRotation"));
+    return g_tryVec3.IsValid() && g_tryQuat.IsValid();
+}
+// The controller's real position and rotation in the world, as one of the hand's parents sees it.
+static bool ReadController(int node, Il2CppObject *hand, int &space, Vector3 &pos, Quaternion &rot) {
+    XRDevice d = G.deviceAtNode(node);
+    if (!d.initialized) return false;
+    Vector3 lp;
+    Quaternion lr;
+    if (!g_tryVec3(d.id, (BNM::Structures::Mono::String *)g_usagePos.get(), &lp)) return false;
+    if (!g_tryQuat(d.id, (BNM::Structures::Mono::String *)g_usageRot.get(), &lr)) return false;
+    Il2CppObject *a = G.trGetParent[hand]();
+    Vector3 handPos = G.trGetPosition[hand]();
+    int best = -1;
+    float bestErr = 0.10f;
+    for (int k = 0; k < 3 && a; k++, a = G.trGetParent[a]()) {
+        if (space >= 0 && k != space) continue;
+        Vector3 w = G.trTransformPoint[a](lp), e = w - handPos;
+        float err = sqrtf(Dot(e, e));
+        if (space >= 0 || err < bestErr) { best = k; bestErr = err; pos = w; rot = G.trGetRotation[a]() * lr; }
+        if (space >= 0) break;
+    }
+    if (best < 0) return false;
+    if (space < 0) space = best;
+    return true;
+}
+static void LongArmsFail(const char *why) {
+    g_laState = 3;
+    if (g_laOwns && !g_dancing) PauseTrackers(false);
+    g_laOwns = false;
+    f_longArms = false;
+    g_dirty = true;
+    ym::log("clientdabell: long arms off: %s", why);
+    Notify("Very Long Arms isn't supported here");
+}
+static void LongArmsTick() {
+    Il2CppObject *head = g_head.get(), *lh = g_leftHand.get(), *rh = g_rightHand.get();
+    bool want = f_longArms && !g_menuShown && !g_dancing && head && lh && rh;
+    if (!want) {
+        if (g_laOwns && !g_dancing) { PauseTrackers(false); g_laOwns = false; }   // the menu and the dances need normal hands
+        if (!f_longArms) g_laState = 0;
+        return;
+    }
+    if (!LaInit() || !G.trTransformPoint.IsValid() || !G.trGetParent.IsValid() || !G.trGetRotation.IsValid()) { LongArmsFail("input functions missing"); return; }
+    Vector3 pl, pr;
+    Quaternion ql, qr;
+    if (g_laState < 2) {                                           // trackers still on: find out how to read the controllers
+        bool okL = ReadController(4, lh, g_laSpaceL, pl, ql), okR = ReadController(5, rh, g_laSpaceR, pr, qr);
+        if (okL && okR) { g_laState = 2; ym::log("clientdabell: long arms ready (spaces %d/%d)", g_laSpaceL, g_laSpaceR); }
+        else if (++g_laChecks > 60) LongArmsFail("controller positions don't match the hands");
+        return;
+    }
+    if (g_pausedN == 0 && g_time >= g_laNextPause) {               // pause the trackers (retry twice a second)
+        g_laNextPause = g_time + 0.5;
+        PauseTrackers(true);
+        g_laOwns = g_pausedN > 0;
+        if (!g_laOwns) ym::log("clientdabell: long arms: couldn't pause the hand trackers");
+    }
+    if (!ReadController(4, lh, g_laSpaceL, pl, ql) || !ReadController(5, rh, g_laSpaceR, pr, qr)) return;
+    Vector3 chest = G.trGetPosition[head]() + Vector3(0, -0.25f, 0);
+    float k = kArmScales[g_armScale];
+    G.trSetPosition[lh](chest + (pl - chest) * k);
+    G.trSetRotation[lh](ql);
+    G.trSetPosition[rh](chest + (pr - chest) * k);
+    G.trSetRotation[rh](qr);
+}
+
+// Mega Jump: press B (Y if the menu is on your right hand) for a jump of any power, in the air too.
+static const float kJumpPowers[] = {6.0f, 10.0f, 16.0f, 24.0f};
+static const char *kJumpNames[] = {"small", "medium", "big", "huge"};
+static int g_jumpPower = 1;
+static bool g_megaPrev = false;
+static double g_nextMega = 0;
+static void NextJumpPower() { g_jumpPower = (g_jumpPower + 1) % 4; Notify("Jump power: %s", kJumpNames[g_jumpPower]); }
+static void MegaJumpTick(const Buttons &in) {
+    bool btn = f_rightHand ? in.y : in.b, press = btn && !g_megaPrev;
+    g_megaPrev = btn;
+    Vector3 v;
+    if (!f_megaJump || !press || g_menuShown || g_time < g_nextMega || !GetVel(v)) return;
+    g_nextMega = g_time + 0.25;
+    SetVel(Vector3(v.x, kJumpPowers[g_jumpPower], v.z));
+}
+
+// Super Fly: like Velocity Fly, but along your head, and a lot faster.
+static void SuperFlyTick(const Buttons &in) {
+    Il2CppObject *head = g_head.get(), *player = g_player.get();
+    if (!f_superFly || !in.a || !head || !player) return;
+    SetVel(G.trGetForward[head]() * 35.0f);
+    if (G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.1f);
+}
+
+// Rocket Boots: hold both triggers and you climb, keeping your sideways speed.
+static void RocketTick(const Buttons &in, float dt) {
+    Vector3 v;
+    if (!f_rocket || !in.ltrig || !in.rtrig || !GetVel(v)) return;
+    v.y += 30.0f * dt;
+    if (v.y > 14.0f) v.y = 14.0f;
+    SetVel(v);
+    if (G.plNoGravityFor.IsValid() && g_player.get()) G.plNoGravityFor[g_player.get()](0.1f);
+}
+
+// Ground Pound: press both grips together to slam straight down.
+static bool g_poundPrev = false;
+static void GroundPoundTick(const Buttons &in) {
+    bool both = in.lgrip && in.rgrip, press = both && !g_poundPrev;
+    g_poundPrev = both;
+    Vector3 v;
+    if (!f_groundPound || !press || !GetVel(v)) return;
+    SetVel(Vector3(0, -35.0f, 0));
+}
+
+// Grapple Hook: hold the left trigger and a rope pulls you toward the spot you point at.
+static Ref g_grappleGo, g_grappleLine;
+static bool g_grappling = false, g_grapplePrev = false;
+static Vector3 g_grapplePoint;
+static void GrappleTick(const Buttons &in, float dt) {
+    Il2CppObject *hand = g_leftHand.get();
+    bool held = f_grapple && in.ltrig && g_dance < 0 && !g_menuShown && hand && G.raycast.IsValid() && G.lrSetPosition.IsValid();
+    bool press = held && !g_grapplePrev;
+    g_grapplePrev = in.ltrig;
+    if (!held) {
+        if (g_grappling) { g_grappling = false; Show(g_grappleGo, false); }
+        return;
+    }
+    Vector3 start = G.trGetPosition[hand](), dir = G.trGetForward[hand]();
+    if (press) {
+        BNM::Structures::Unity::RaycastHit hit{};
+        if (!G.raycast(start + dir * 0.25f, dir, &hit, 80.0f, -5)) return;
+        g_grapplePoint = hit.point;
+        g_grappling = true;
+        if (!g_grappleLine.get()) {                                // the rope is made once
+            Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellGrapple"));
+            Il2CppObject *line = lineGo && G.tLine ? G.goAddComponent[lineGo](G.tLine) : nullptr;
+            if (!line) { g_grappling = false; return; }
+            if (Il2CppObject *m = G.rendererGetMaterial[line]()) {
+                if (G.shader.get()) G.matSetShader[m](G.shader.get());
+                G.matSetColor[m](Color(1.0f, 1.0f, 1.0f, 1));
+            }
+            G.lrSetStartWidth[line](0.02f);
+            G.lrSetEndWidth[line](0.02f);
+            G.lrSetPositionCount[line](2);
+            G.lrSetUseWorldSpace[line](true);
+            g_grappleGo.set(lineGo);
+            g_grappleLine.set(line);
+        }
+        Show(g_grappleGo, true);
+    }
+    Vector3 body, v;
+    if (!g_grappling || !BodyPos(body) || !GetVel(v) || !Alive(g_grappleLine.get())) return;
+    Vector3 to = g_grapplePoint - body;
+    float dist = sqrtf(Dot(to, to));
+    if (dist < 1.5f) { g_grappling = false; Show(g_grappleGo, false); return; }   // arrived
+    v = v + to * (45.0f * dt / dist);
+    float speed = sqrtf(Dot(v, v));
+    if (speed > 28.0f) v = v * (28.0f / speed);
+    SetVel(v);
+    G.lrSetPosition[g_grappleLine.get()](0, start);
+    G.lrSetPosition[g_grappleLine.get()](1, g_grapplePoint);
+}
+
+// Big Hands: both hands are scaled up and put back afterwards.
+static Method<Vector3> g_trGetScale;
+static bool g_bigApplied = false;
+static Vector3 g_handScaleL, g_handScaleR;
+static void ApplyBigHands() {
+    Il2CppObject *lh = g_leftHand.get(), *rh = g_rightHand.get();
+    if (!lh || !rh) return;
+    if (!g_trGetScale.IsValid()) g_trGetScale = Class("UnityEngine", "Transform").GetMethod("get_localScale", 0);
+    if (!g_trGetScale.IsValid()) return;
+    if (f_bigHands && !g_bigApplied) {
+        g_handScaleL = g_trGetScale[lh]();
+        g_handScaleR = g_trGetScale[rh]();
+        G.trSetLocalScale[lh](g_handScaleL * 2.5f);
+        G.trSetLocalScale[rh](g_handScaleR * 2.5f);
+        g_bigApplied = true;
+    } else if (!f_bigHands && g_bigApplied) {
+        G.trSetLocalScale[lh](g_handScaleL);
+        G.trSetLocalScale[rh](g_handScaleR);
+        g_bigApplied = false;
+    }
+}
+
+static void OverpoweredOff() {
+    for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) { *it.flag = false; if (it.fn) it.fn(); }
+    Notify("Overpowered off");
+}
+static void OverpoweredTick(const Buttons &in, float dt) {
+    MegaJumpTick(in);
+    SuperFlyTick(in);
+    RocketTick(in, dt);
+    GrappleTick(in, dt);
+    GroundPoundTick(in);
+    if (f_bigHands != g_bigApplied) ApplyBigHands();           // also puts them back after Turn Everything Off
+    LongArmsTick();
+}
+static void OverpoweredReset() {                               // room change: the old objects are gone
+    Kill(g_grappleGo);
+    g_grappleLine.clear();
+    g_grappling = g_grapplePrev = false;
+    g_bigApplied = false;
+    g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; g_laOwns = false;
+    g_megaPrev = g_poundPrev = false;
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
@@ -2055,6 +2332,7 @@ static void OnRoomChange() {
     g_dancing = false;
     g_gunLine.clear();
     WeatherReset();
+    OverpoweredReset();
     if (g_noclipOn && g_player.get()) {           // leaving the room mid-noclip: put things back
         Buttons none;                             // trigger "released"
         NoclipTick(none);
@@ -2112,12 +2390,17 @@ static void OnUpdate(float dt) {
     catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
     try { WeatherTick(dt); }
     catch (...) { WeatherOff(); g_wx = -1; for (bool &b : g_wxSel) b = false; ym::log("clientdabell: effects error, turned off"); }
+    try { OverpoweredTick(in, dt); }
+    catch (...) {
+        for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) *it.flag = false;
+        ym::log("clientdabell: overpowered error, turned off");
+    }
     DanceTick(in, dt);              // last: it moves your hands after everything else
 }
 
 YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     if (!ym::init(api)) return -1;
     ym::onUpdate(OnUpdate);
-    ym::log("ClientDaBell loaded on %s (%s)", api->gameVersion, api->buildId);
+    ym::log("ClientDaBell %s loaded on %s (%s)", CDB_VERSION, api->gameVersion, api->buildId);
     return 0;
 }
