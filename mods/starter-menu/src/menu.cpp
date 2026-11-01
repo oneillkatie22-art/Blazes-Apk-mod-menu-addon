@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.1"
+#define CDB_VERSION "v1.2.3"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -370,7 +370,7 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
 static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
-static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_bigHands;   // Overpowered
+static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_bigHands, f_flingGun, f_propGun;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
@@ -501,6 +501,8 @@ static Item g_items[] = {
     {OVERPOWERED, "Grapple Hook", TOGGLE, MAIN, &f_grapple},
     {OVERPOWERED, "Ground Pound", TOGGLE, MAIN, &f_groundPound},
     {OVERPOWERED, "Big Hands", TOGGLE, MAIN, &f_bigHands, ApplyBigHands},
+    {OVERPOWERED, "Fling Gun", TOGGLE, MAIN, &f_flingGun},
+    {OVERPOWERED, "Launch Items Gun", TOGGLE, MAIN, &f_propGun},
     {OVERPOWERED, "Turn Overpowered Off", ACTION, MAIN, nullptr, OverpoweredOff},
 
     {SETTINGS, "Exit Settings", OPEN, MAIN},
@@ -577,7 +579,9 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Super Fly", "Hold A to rocket where you look."},
     {"Rocket Boots", "Hold both triggers to shoot upward."},
     {"Grapple Hook", "Hold either trigger (or both) to swing toward what that hand points at."},
-    {"Ground Pound", "Press both grips to slam down."},
+    {"Ground Pound", "Both grips: mace smash with a shockwave."},
+    {"Launch Items Gun", "Free-hand grip shoots local-only props."},
+    {"Fling Gun", "Press A (X) to fling yourself where you point."},
     {"Big Hands", "Your hands get a lot bigger. Held items grow too."},
     {"Turn Overpowered Off", "Switches every Overpowered mod off."},
     {"Change Pointer Position", "Moves the ball on your finger."},
@@ -2156,6 +2160,31 @@ static bool ReadController(int node, Il2CppObject *hand, int &space, Vector3 &po
     if (space < 0) space = best;
     return true;
 }
+// Stretch mode needs the trackers to place the hands during Update (before this mod runs), not just
+// before rendering, or they would move the hands back after every stretch. Done once per room.
+static bool g_laTrackersSet = false;
+static void SetTrackersToUpdate() {
+    if (g_laTrackersSet || !G.trGetParent.IsValid()) return;
+    g_laTrackersSet = true;
+    int found = 0, changed = 0;
+    for (auto nc : std::vector<std::tuple<const char *, const char *, const char *>>{
+             {"UnityEngine.XR.Interaction.Toolkit", "XRBaseController", "set_updateTrackingType"},
+             {"UnityEngine.InputSystem.XR", "TrackedPoseDriver", "set_updateType"},
+             {"UnityEngine.SpatialTracking", "TrackedPoseDriver", "set_updateType"}}) {
+        Class c(std::get<0>(nc), std::get<1>(nc));
+        if (!c.IsValid()) continue;
+        Method<void> setter = c.GetMethod(std::get<2>(nc), 1);
+        for (Il2CppObject *t : {g_leftHand.get(), g_rightHand.get()})
+            for (int up = 0; up < 3 && t; up++, t = G.trGetParent[t]()) {
+                Il2CppObject *go = G.compGameObject[t]();
+                Il2CppObject *comp = go ? G.goGetComponent[go]((Il2CppObject *)c.GetMonoType()) : nullptr;
+                if (!comp) continue;
+                found++;
+                if (setter.IsValid()) { setter[comp](0); changed++; }
+            }
+    }
+    ym::log("clientdabell: long arms stretch: %d trackers found, %d set to Update", found, changed);
+}
 static bool g_laStretch = false;               // fallback: stretch the hand from where the trackers just put it
 static void LongArmsFail(const char *why) {
     g_laState = 3;
@@ -2181,9 +2210,15 @@ static void LongArmsTick() {
         ym::log("clientdabell: long arms: controller input not available, using stretch mode");
     }
     if (g_laStretch) {                                             // the trackers place the hands each frame; push them outward from the chest
+        SetTrackersToUpdate();
         Vector3 chest = G.trGetPosition[head]() + Vector3(0, -0.25f, 0);
         float k = kArmScales[g_armScale];
-        for (Il2CppObject *h : {lh, rh}) G.trSetPosition[h](chest + (G.trGetPosition[h]() - chest) * k);
+        static int logged = 0;
+        for (Il2CppObject *h : {lh, rh}) {
+            Vector3 before = G.trGetPosition[h]();
+            G.trSetPosition[h](chest + (before - chest) * k);
+            if (logged < 4) { Vector3 after = G.trGetPosition[h](); ym::log("clientdabell: stretch hand %.2f,%.2f,%.2f -> %.2f,%.2f,%.2f", before.x, before.y, before.z, after.x, after.y, after.z); logged++; }
+        }
         return;
     }
     if (g_laState < 2) {                                           // trackers still on: find out how to read the controllers
@@ -2241,14 +2276,132 @@ static void RocketTick(const Buttons &in, float dt) {
     if (G.plNoGravityFor.IsValid() && g_player.get()) G.plNoGravityFor[g_player.get()](0.1f);
 }
 
-// Ground Pound: press both grips together to slam straight down.
-static bool g_poundPrev = false;
+// Ground Pound (mace style): press both grips to slam straight down. The harder the fall, the
+// bigger the smash: on landing a shockwave ring spreads out from your feet and you bounce back up.
+// All of it is only on your own screen and your own body.
+static bool g_poundPrev = false, g_pounding = false;
+static double g_poundStart = 0, g_ringStart = -1;
+static float g_poundTopY = 0, g_ringPower = 1;
+static Vector3 g_ringAt;
+static Ref g_ring[2];
+static void RingTick() {
+    if (g_ringStart < 0) return;
+    float t = (float)(g_time - g_ringStart) / 0.55f;
+    if (t >= 1) { g_ringStart = -1; for (auto &r : g_ring) Show(r, false); return; }
+    for (int i = 0; i < 2; i++) {
+        Il2CppObject *o = g_ring[i].get();
+        if (!Alive(o)) continue;
+        float tt = t - i * 0.12f;
+        bool vis = tt > 0;
+        Show(g_ring[i], vis);
+        if (!vis) continue;
+        float e = 1 - (1 - tt) * (1 - tt);
+        float r = (1.0f + 6.0f * g_ringPower * e) * 2;             // diameter
+        float th = 0.06f * (1 - tt) + 0.005f;
+        Il2CppObject *tr = Tr(o);
+        G.trSetPosition[tr](g_ringAt + Vector3(0, 0.03f + i * 0.03f, 0));
+        G.trSetLocalScale[tr](Vector3(r, th, r));
+        SetColor(o, i ? Color(1.0f, 0.85f, 0.4f, 1) : Color(1.0f, 1.0f, 1.0f, 1));
+    }
+}
 static void GroundPoundTick(const Buttons &in) {
     bool both = in.lgrip && in.rgrip, press = both && !g_poundPrev;
     g_poundPrev = both;
+    RingTick();
+    Vector3 v, body;
+    if (!f_groundPound || !GetVel(v) || !BodyPos(body)) return;
+    if (press) {
+        g_pounding = true;
+        g_poundStart = g_time;
+        g_poundTopY = body.y;
+        SetVel(Vector3(0, -35.0f, 0));
+        return;
+    }
+    if (!g_pounding) return;
+    if (g_time - g_poundStart > 4.0) { g_pounding = false; return; }
+    if (g_time - g_poundStart < 0.12 || v.y > -6.0f) {
+        if (g_time - g_poundStart >= 0.12 && v.y > -6.0f) {        // landed
+            g_pounding = false;
+            float fall = g_poundTopY - body.y;
+            g_ringPower = fall < 1 ? 0.5f : fall > 12 ? 2.0f : 0.5f + 1.5f * (fall - 1) / 11;
+            g_ringAt = body;
+            BNM::Structures::Unity::RaycastHit hit{};
+            if (G.raycast.IsValid() && G.raycast(body, Vector3(0, -1, 0), &hit, 3.0f, -5)) g_ringAt = hit.point;
+            for (auto &r : g_ring)
+                if (!Alive(r.get())) {
+                    Il2CppObject *o = Prim(2, Color(1, 1, 1, 1), false);   // flat cylinder = a ring on the ground
+                    if (o) r.set(o);
+                }
+            g_ringStart = g_time;
+            SetVel(Vector3(v.x, 5.0f + 5.0f * g_ringPower, v.z));      // the bounce
+            Buzz();
+            Notify("SMASH!");
+        }
+    }
+}
+
+// Fling Gun: press A (X if the menu is on your right hand) to launch yourself the way your free hand points.
+static bool g_flingPrev = false;
+static double g_flingNext = 0;
+static void FlingGunTick(const Buttons &in) {
+    bool btn = f_rightHand ? in.x : in.a, press = btn && !g_flingPrev;
+    g_flingPrev = btn;
+    Il2CppObject *hand = f_rightHand ? g_leftHand.get() : g_rightHand.get();
     Vector3 v;
-    if (!f_groundPound || !press || !GetVel(v)) return;
-    SetVel(Vector3(0, -35.0f, 0));
+    if (!f_flingGun || !press || g_menuShown || g_dance >= 0 || !hand || g_time < g_flingNext || !GetVel(v)) return;
+    g_flingNext = g_time + 0.4;
+    SetVel(G.trGetForward[hand]() * 32.0f);
+    Buzz();
+}
+
+// Launch Items Gun: squeeze the grip of your free hand to shoot colorful blocks and balls that fly,
+// bounce and fade. They are local props that only you see; real room items are never touched.
+static constexpr int kMaxShots = 24;
+struct Shot { Ref go; Vector3 pos, vel; double born = -1; };
+static Shot g_shots[kMaxShots];
+static int g_shotNext = 0;
+static bool g_shotPrev = false;
+static double g_shotCool = 0;
+static void ItemGunTick(const Buttons &in, float dt) {
+    bool grip = f_rightHand ? in.lgrip : in.rgrip, other = f_rightHand ? in.rgrip : in.lgrip;
+    bool press = grip && !other && !g_shotPrev;
+    g_shotPrev = grip;
+    Il2CppObject *hand = f_rightHand ? g_leftHand.get() : g_rightHand.get();
+    if (f_propGun && press && !g_menuShown && g_dance < 0 && hand && g_time >= g_shotCool && G.createPrimitive.IsValid()) {
+        g_shotCool = g_time + 0.2;
+        Shot &s = g_shots[g_shotNext];
+        g_shotNext = (g_shotNext + 1) % kMaxShots;
+        Kill(s.go);                                                // recycle the oldest
+        float h = fmodf((float)g_time * 0.37f, 1.0f);
+        Il2CppObject *o = Prim(g_shotNext % 2 ? 0 : 3, Rainbow(h), false);
+        if (o) {
+            G.trSetLocalScale[Tr(o)](Vector3(0.25f, 0.25f, 0.25f));
+            s.go.set(o);
+            Vector3 d = G.trGetForward[hand]();
+            s.pos = G.trGetPosition[hand]() + d * 0.3f;
+            s.vel = d * 22.0f;
+            s.born = g_time;
+            G.trSetPosition[Tr(o)](s.pos);
+            Buzz();
+        }
+    }
+    for (auto &s : g_shots) {
+        Il2CppObject *o = s.go.get();
+        if (!o) continue;
+        if (!Alive(o) || g_time - s.born > 6.0 || !f_propGun) { Kill(s.go); continue; }
+        Vector3 from = s.pos;
+        s.vel.y -= 9.8f * dt;
+        s.pos = s.pos + s.vel * dt;
+        Vector3 seg = s.pos - from;
+        float len = sqrtf(Dot(seg, seg));
+        BNM::Structures::Unity::RaycastHit hit{};
+        if (len > 1e-4f && G.raycast.IsValid() && G.raycast(from, seg * (1.0f / len), &hit, len + 0.12f, -5)) {
+            float vn = Dot(s.vel, hit.normal);
+            s.vel = (s.vel - hit.normal * (2 * vn)) * 0.55f;       // bounce, losing energy
+            s.pos = hit.point + hit.normal * 0.14f;
+        }
+        G.trSetPosition[Tr(o)](s.pos);
+    }
 }
 
 // Grapple Hook: hold a trigger (either hand, or both) and a rope pulls you toward the spot that hand points at.
@@ -2338,14 +2491,20 @@ static void OverpoweredTick(const Buttons &in, float dt) {
     RocketTick(in, dt);
     GrappleTick(in, dt);
     GroundPoundTick(in);
+    FlingGunTick(in);
+    ItemGunTick(in, dt);
     if (f_bigHands != g_bigApplied) ApplyBigHands();           // also puts them back after Turn Everything Off
     LongArmsTick();
 }
 static void OverpoweredReset() {                               // room change: the old objects are gone
+    g_laTrackersSet = false;
     for (auto &g : g_grap) { Kill(g.go); g.line.clear(); g.on = g.prev = false; }
     g_bigApplied = false;
     g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; g_laOwns = false;
-    g_megaPrev = g_poundPrev = false;
+    g_megaPrev = g_poundPrev = g_pounding = g_flingPrev = g_shotPrev = false;
+    for (auto &sh : g_shots) { Kill(sh.go); sh.born = -1; }
+    g_ringStart = -1;
+    for (auto &r : g_ring) Kill(r);
 }
 
 // ---- callbacks ---------------------------------------------------------------
