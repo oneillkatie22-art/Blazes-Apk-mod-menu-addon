@@ -503,7 +503,7 @@ static Item g_items[] = {
     {EFFECTS, "Effect Intensity", ACTION, MAIN, nullptr, NextWeatherIntensity},
 
     {OVERPOWERED, "Exit Overpowered", OPEN, MAIN},
-    {OVERPOWERED, "Very Long Arms", TOGGLE, MAIN, &f_longArms, LongArmsToggled},
+    {OVERPOWERED, "Long Arms", TOGGLE, MAIN, &f_longArms, LongArmsToggled},
     {OVERPOWERED, "Arm Length", ACTION, MAIN, nullptr, NextArmLength},
     {OVERPOWERED, "Super Speed", TOGGLE, MAIN, &f_superSpeed, ApplySpeedBoost},
     {OVERPOWERED, "Mega Jump", TOGGLE, MAIN, &f_megaJump},
@@ -583,8 +583,8 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Thunderstorm", "Rain with lightning and thunder."},
     {"Effect Intensity", "Light, medium or heavy."},
     {"Overpowered", "The overpowered mods. Two pages."},
-    {"Very Long Arms", "Your arms reach a long way. Hands go normal while the menu is open."},
-    {"Arm Length", "How long the arms are: 4x, 6x, 8x or 12x."},
+    {"Long Arms", "Your arms reach farther. Hands go normal while the menu is open."},
+    {"Arm Length", "How long the arms are: 1.5x, 2x, 3x or 4x."},
     {"Super Speed", "A lot faster and higher jumps than Speed Boost."},
     {"Mega Jump", "Press B for a huge jump, even in the air. (Y with the right hand menu.)"},
     {"Jump Power", "Small, medium, big or huge jump."},
@@ -2123,9 +2123,9 @@ static void WeatherTick(float dt) {
 // ---- Overpowered (all of it changes only your own body; nothing is sent) ---------------
 // Very Long Arms moves your own hands, like the dances do, so the room sees the long arms
 // the way it sees any pose: the game sends your hands as usual and nothing extra goes out.
-static const float kArmScales[] = {4.0f, 6.0f, 8.0f, 12.0f};
-static int g_armScale = 2;
-static void NextArmLength() { g_armScale = (g_armScale + 1) % 4; Notify("Arm length: %dx", (int)kArmScales[g_armScale]); }
+static const float kArmScales[] = {1.5f, 2.0f, 3.0f, 4.0f};
+static int g_armScale = 1;
+static void NextArmLength() { g_armScale = (g_armScale + 1) % 4; Notify("Arm length: %.1fx", kArmScales[g_armScale]); }
 
 // To stretch an arm the controller trackers have to be paused (they would put the hand back),
 // so the real controller position is read from the headset's input instead. That position is
@@ -2215,7 +2215,7 @@ static void LongArmsFail(const char *why) {
     f_longArms = false;
     g_dirty = true;
     ym::log("clientdabell: long arms off: %s", why);
-    Notify("Very Long Arms isn't supported here");
+    Notify("Long Arms isn't supported here");
 }
 static void LongArmsTick() {
     Il2CppObject *head = g_head.get(), *lh = g_leftHand.get(), *rh = g_rightHand.get();
