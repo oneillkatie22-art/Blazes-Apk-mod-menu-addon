@@ -1,4 +1,4 @@
-// Blaze Menu (the starter menu): a hand menu in the style of ii's Stupid Menu (Gorilla Tag).
+// ClientDaBell: a hand menu built from the starter menu (ii's Stupid Menu layout).
 // The layout idea comes from ii's menu; the code is new.
 //   Hold Y (left hand)      -> menu on your left hand, tipped like ii's; turn your palm to you
 //                              (B and the right hand with "Right Hand Menu")
@@ -12,6 +12,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
+#include <algorithm>
+#include <dirent.h>
+#include <strings.h>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -20,7 +24,7 @@ using namespace BNM;
 using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
-YEEPS_MOD("Blaze Menu")
+YEEPS_MOD("ClientDaBell")
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -82,6 +86,11 @@ static struct {
     Method<XRDevice> deviceAtNode;
     Method<Il2CppObject *> trGetParent, trGetRoot, getComponentsInChildren, netLocal;
     Method<void> pvRpc;
+    Method<Il2CppObject *> audioClipCreate;           // soundboard
+    Method<bool> audioClipSetData;
+    Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
+    BNM::MonoType *tAudioSource = nullptr;
+    BNM::IL2CPP::Il2CppClass *floatClass = nullptr;
     BNM::IL2CPP::MethodInfo *rpcCreateItem = nullptr;     // only read for its parameter types
     BNM::IL2CPP::Il2CppClass *objectClass = nullptr, *stringClass = nullptr;
     BNM::MonoType *tPhotonView = nullptr, *tItem = nullptr;
@@ -119,7 +128,7 @@ static bool Lookups() {
           sh("UnityEngine", "Shader"), res("UnityEngine", "Resources"), text("UnityEngine.UI", "Text"),
           graphic("UnityEngine.UI", "Graphic"), canvas("UnityEngine", "Canvas"), rt("UnityEngine", "RectTransform"),
           dev("UnityEngine.XR", "InputDevices"), player("", "MasterPlayer", Image("Assembly-CSharp.dll"));
-    if (!go || !tr || !player || !dev) { ym::log("starter-menu: game classes missing"); return false; }
+    if (!go || !tr || !player || !dev) { ym::log("clientdabell: game classes missing"); return false; }
     G.createPrimitive = go.GetMethod("CreatePrimitive", 1);
     G.goTransform = go.GetMethod("get_transform", 0);
     G.goGetComponent = Overload(go, "GetComponent", {"System.Type"});
@@ -130,6 +139,23 @@ static bool Lookups() {
     G.compGameObject = comp.GetMethod("get_gameObject", 0);
     G.destroy = Overload(obj, "Destroy", {"UnityEngine.Object"});
     G.alive = obj.GetMethod("op_Implicit", 1);
+    {
+        Class aclip("UnityEngine", "AudioClip"), asrc("UnityEngine", "AudioSource"), flt("System", "Single");
+        if (flt.IsValid()) G.floatClass = flt.GetClass();
+        if (aclip.IsValid()) {
+            G.audioClipCreate = Overload(aclip, "Create", {"System.String", "System.Int32", "System.Int32", "System.Int32", "System.Boolean"});
+            G.audioClipSetData = aclip.GetMethod("SetData", 2);
+        }
+        if (asrc.IsValid()) {
+            G.tAudioSource = asrc.GetMonoType();
+            G.asSetClip = asrc.GetMethod("set_clip", 1);
+            G.asSetVolume = asrc.GetMethod("set_volume", 1);
+            G.asSetSpatial = asrc.GetMethod("set_spatialBlend", 1);
+            G.asSetLoop = asrc.GetMethod("set_loop", 1);
+            G.asPlay = asrc.GetMethod("Play", 0);
+            G.asStop = asrc.GetMethod("Stop", 0);
+        }
+    }
     G.trSetParent = Overload(tr, "SetParent", {"UnityEngine.Transform", "System.Boolean"});
     G.trSetPosition = tr.GetMethod("set_position", 1);
     G.trSetRotation = tr.GetMethod("set_rotation", 1);
@@ -179,7 +205,7 @@ static bool Lookups() {
     G.plSetVelocity = player.GetMethod("ApplySetVelocityNoHaptic", 1);
     if (!G.plSetVelocity.IsValid()) G.plSetVelocity = player.GetMethod("ApplySetVelocity", 1);
     G.plNoGravityFor = player.GetMethod("ApplyNoGravityDuration", 1);
-    ym::log("starter-menu: velocity %d/%d, no-gravity %d", G.plGetVelocity.IsValid(), G.plSetVelocity.IsValid(),
+    ym::log("clientdabell: velocity %d/%d, no-gravity %d", G.plGetVelocity.IsValid(), G.plSetVelocity.IsValid(),
             G.plNoGravityFor.IsValid());
     G.goSetLayer = go.GetMethod("set_layer", 1);
     G.jumpMultiplier = player.GetField("jumpMultiplier");
@@ -228,7 +254,7 @@ static bool Lookups() {
         G.stringClass = Class("System", "String").GetClass();
         G.arrayNew = (decltype(G.arrayNew))ym::api()->resolve("il2cpp_array_new");
         G.valueBox = (decltype(G.valueBox))ym::api()->resolve("il2cpp_value_box");
-        ym::log("starter-menu: items rpc=%d pv=%d item=%d box=%d", G.rpcCreateItem != nullptr, G.pvRpc.IsValid(),
+        ym::log("clientdabell: items rpc=%d pv=%d item=%d box=%d", G.rpcCreateItem != nullptr, G.pvRpc.IsValid(),
                 G.itemKey.IsValid(), G.arrayNew && G.valueBox);
     }
     Class behaviour("UnityEngine", "Behaviour");
@@ -264,7 +290,7 @@ static bool Lookups() {
     }
     G.ok = G.createPrimitive.IsValid() && G.goTransform.IsValid() && G.trSetPosition.IsValid() &&
            G.deviceAtNode.IsValid() && G.tryGetBool.IsValid() && G.leftHand.IsValid();
-    if (!G.ok) ym::log("starter-menu: some game methods are missing, menu off");
+    if (!G.ok) ym::log("clientdabell: some game methods are missing, menu off");
     return G.ok;
 }
 
@@ -319,7 +345,8 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
+static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
 static std::vector<PendingItem> g_itemQueue;
@@ -350,9 +377,16 @@ static void DancePicked();
 static void ArmDupe9();
 static void ArmDupe27();
 static bool LeftHandItem();
+static void ScanSongs();
+static void PlaySong();
+static void NextSong();
+static void PrevSong();
+static void StopSound();
+static void ApplyLoop();
+static void NextSoundVolume();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SETTINGS, ENABLED, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Settings", "Enabled Mods"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, SETTINGS, ENABLED, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Settings", "Enabled Mods"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -368,6 +402,7 @@ static Item g_items[] = {
     {MAIN, "Movement Mods", OPEN, MOVEMENT},
     {MAIN, "Rig Mods", OPEN, RIG},
     {MAIN, "Items", OPEN, ITEMS},
+    {MAIN, "Soundboard", OPEN, SOUNDBOARD},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
@@ -401,6 +436,15 @@ static Item g_items[] = {
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
+
+    {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
+    {SOUNDBOARD, g_soundLabel, ACTION, MAIN, nullptr, PlaySong},
+    {SOUNDBOARD, "Next Song", ACTION, MAIN, nullptr, NextSong},
+    {SOUNDBOARD, "Previous Song", ACTION, MAIN, nullptr, PrevSong},
+    {SOUNDBOARD, "Stop Sound", ACTION, MAIN, nullptr, StopSound},
+    {SOUNDBOARD, "Loop", TOGGLE, MAIN, &f_soundLoop, ApplyLoop},
+    {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
+    {SOUNDBOARD, "Rescan Songs", ACTION, MAIN, nullptr, ScanSongs},
 
     {SETTINGS, "Exit Settings", OPEN, MAIN},
     {SETTINGS, "Change Pointer Position", ACTION, MAIN, nullptr, NextPointer},
@@ -436,7 +480,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Low Gravity", "Jump higher, fall slower."},
     {"Save Spot", "Remembers where you are."},
     {"Go To Spot", "Teleports you to your saved spot."},
-    {"Change Menu Theme", "Blaze, Orange, Blue, Green, Purple, Dark."},
+    {"Change Menu Theme", "ClientDaBell, Orange, Blue, Green, Purple, Dark."},
     {"Rainbow Menu", "The menu cycles through colors."},
     {"Show FPS", "Frames per second in the title."},
     {"Show Clock", "The time in the title."},
@@ -454,6 +498,13 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Jumping Jacks", "Arms go up and down at your sides. Hold left trigger."},
     {"Spaz", "Hands shake all over the place. Hold left trigger."},
     {"Beyblade", "Hands spin fast around your waist. Hold left trigger."},
+    {"Soundboard", "Plays .wav songs from the sounds folder. Only you hear them."},
+    {"Next Song", "Picks the next song in the list."},
+    {"Previous Song", "Picks the previous song in the list."},
+    {"Stop Sound", "Stops the song (and cancels a loading one)."},
+    {"Loop", "Repeats the song until you stop it."},
+    {"Sound Volume", "Quiet, medium or loud."},
+    {"Rescan Songs", "Looks in the sounds folder again."},
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
@@ -469,7 +520,7 @@ static const char *TipFor(const char *label) {
 // Colors in the ii menu style: an animated background and darker buttons when on.
 struct Theme { const char *name; Color bgA, bgB, button, buttonOn, title; };
 static const Theme kThemes[] = {
-    {"Blaze",  Color(0.90f, 0.12f, 0.04f, 1), Color(1.0f, 0.42f, 0.0f, 1), Color(0.50f, 0.06f, 0.03f, 1), Color(1.0f, 0.45f, 0.05f, 1), Color(1.0f, 0.62f, 0.20f, 1)},
+    {"ClientDaBell",  Color(0.90f, 0.12f, 0.04f, 1), Color(1.0f, 0.42f, 0.0f, 1), Color(0.50f, 0.06f, 0.03f, 1), Color(1.0f, 0.45f, 0.05f, 1), Color(1.0f, 0.62f, 0.20f, 1)},
     {"Orange", Color(1.0f, 0.50f, 0.0f, 1), Color(1.0f, 0.40f, 0.0f, 1), Color(0.67f, 0.33f, 0.0f, 1), Color(0.33f, 0.16f, 0.0f, 1), Color(1.0f, 0.75f, 0.49f, 1)},
     {"Blue",   Color(0.20f, 0.50f, 1.0f, 1), Color(0.10f, 0.30f, 0.85f, 1), Color(0.10f, 0.28f, 0.65f, 1), Color(0.04f, 0.12f, 0.32f, 1), Color(0.70f, 0.85f, 1.0f, 1)},
     {"Green",  Color(0.30f, 0.85f, 0.30f, 1), Color(0.15f, 0.65f, 0.20f, 1), Color(0.12f, 0.45f, 0.12f, 1), Color(0.05f, 0.22f, 0.05f, 1), Color(0.75f, 1.0f, 0.75f, 1)},
@@ -587,7 +638,7 @@ static void BuildMenu() {
     auto NewObject = [](const char *name) {
         return Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString(name));
     };
-    Il2CppObject *menu = NewObject("BlazeMenu"), *board = NewObject("BlazeMenuBoard");
+    Il2CppObject *menu = NewObject("ClientDaBellMenu"), *board = NewObject("ClientDaBellMenuBoard");
     if (!menu || !board) return;
     g_menu.set(menu);
     g_board.set(board);
@@ -608,14 +659,14 @@ static void BuildMenu() {
 
     if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), kBoardW + 2 * kSideX, kBoardH + 0.1f)) {
         Il2CppObject *ct = Tr(canvas);
-        Label(ct, "Blaze", Vector3(0, kTitleY, 0), kBtnW, 0.045f, 32, &g_title);
+        Label(ct, "ClientDaBell", Vector3(0, kTitleY, 0), kBtnW, 0.045f, 32, &g_title);
         for (int r = 0; r < kRows; r++)
             g_rowLabel[r].set(Label(ct, "", Vector3(0, RowY(r), 0), kBtnW, kBtnH, 19, &g_rowText[r]));
         Label(ct, "<", Vector3(-kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, "", Vector3(0, -kBoardH / 2 - 0.02f, 0), kBoardW + 0.1f, 0.03f, 15, &g_tipText);
         char ver[64];
-        snprintf(ver, sizeof ver, "Blaze build %s", ym::api()->gameVersion);
+        snprintf(ver, sizeof ver, "ClientDaBell build %s", ym::api()->gameVersion);
         Label(ct, ver, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
     }
     // Pointer: a small ball on the index finger of the other hand
@@ -678,15 +729,15 @@ static void RenderPage() {
 
 static int Hex(float v) { return (int)(v < 0 ? 0 : v > 1 ? 255 : v * 255); }
 
-// The title is "Blaze" with a moving red-orange-yellow gradient, one color per letter
+// The title is "ClientDaBell" with a moving red-orange-yellow gradient, one color per letter
 // (rich text). Rebuilt ten times a second, not every frame.
 static void UpdateTitle() {
     if (g_time < g_nextTitle) return;
     g_nextTitle = g_time + 0.1;
     static const Color kFire[] = {Color(1, 0.1f, 0.05f, 1), Color(1, 0.45f, 0, 1), Color(1, 0.8f, 0.2f, 1), Color(1, 0.45f, 0, 1)};
-    char buf[512];
+    char buf[1024];
     int n = 0;
-    const char *word = "Blaze";
+    const char *word = "ClientDaBell";
     for (int i = 0; word[i]; i++) {
         float t = (float)g_time * 1.5f - i * 0.35f;
         Color c;
@@ -751,6 +802,7 @@ static void Press(Item *it) {
     case OPEN:
         g_cat = it->target;
         g_page = 0;
+        if (it->target == SOUNDBOARD) ScanSongs();      // lists the songs in the sounds folder
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
@@ -762,7 +814,7 @@ static void Press(Item *it) {
         break;
     }
     g_dirty = true;
-    ym::log("starter-menu: %s", it->label);
+    ym::log("clientdabell: %s", it->label);
 }
 
 // Which part of the menu the pointer touches: row 0..7, -1 = <, kRows = >, -2 = nothing.
@@ -877,6 +929,7 @@ static void AllOff() {
     for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
     g_dupeArmed = 0;
+    StopSound();
     g_itemQueue.clear();
     PointerToHand();
     Notify("Everything off");
@@ -912,7 +965,7 @@ static void PlatformFor(bool held, Ref &platform, Ref &hand) {
         layer = -1;
         int mask = G.locomotionLayers.IsValid() && g_player.get() ? G.locomotionLayers[g_player.get()]() : 0;
         for (int i = 0; i < 32 && layer < 0; i++) if (mask & (1 << i)) layer = i;
-        ym::log("starter-menu: hand layers 0x%x, platforms on layer %d", mask, layer);
+        ym::log("clientdabell: hand layers 0x%x, platforms on layer %d", mask, layer);
     }
     if (layer >= 0 && G.goSetLayer.IsValid()) G.goSetLayer[p](layer);
     Il2CppObject *t = Tr(p);
@@ -1061,7 +1114,7 @@ static void NoclipTick(const Buttons &in) {
         for (int l = 0; l < 32; l++)
             if (mask & (1 << l)) G.ignoreLayers(g_bodyLayer, l, want);
     PlayerColliders(want);
-    if (want) ym::log("starter-menu: noclip on (layers 0x%x, body layer %d, %d colliders off)", mask, g_bodyLayer, g_noclipOffN);
+    if (want) ym::log("clientdabell: noclip on (layers 0x%x, body layer %d, %d colliders off)", mask, g_bodyLayer, g_noclipOffN);
 }
 
 // Teleport Gun: hold right grip to aim (a line and a ball show where you land), press
@@ -1080,7 +1133,7 @@ static void TeleportGunTick(const Buttons &in) {
     if (!hand || !G.raycast.IsValid() || !G.lrSetPosition.IsValid()) return;
     if (!g_gunBall.get()) {                              // made once per room
         Il2CppObject *ball = Prim(0, T().bgB, false);
-        Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("BlazeGunLine"));
+        Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellGunLine"));
         Il2CppObject *line = lineGo && G.tLine ? G.goAddComponent[lineGo](G.tLine) : nullptr;
         if (!ball || !line) return;
         G.trSetLocalScale[Tr(ball)](Vector3(0.1f, 0.1f, 0.1f));
@@ -1174,7 +1227,7 @@ static void DanceTick(const Buttons &in, float dt) {
     if (want != g_dancing) {
         PauseTrackers(want);
         g_dancing = want;
-        if (want) ym::log("starter-menu: dancing, paused %d trackers", g_pausedN);
+        if (want) ym::log("clientdabell: dancing, paused %d trackers", g_pausedN);
     }
     if (!want) return;
     Vector3 hp = G.trGetPosition[head](), f = Flat(G.trGetForward[head]()), up(0, 1, 0);
@@ -1307,7 +1360,7 @@ static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, 
             if (tn.size() > 30) tn = k && k->byval_arg.valuetype ? (k->enumtype ? "enum" : "struct" + std::to_string(k->instance_size - 16)) : "class";
             sig += (i ? "," : "") + tn;
         }
-        ym::log("starter-menu: item message takes %s", sig.c_str());
+        ym::log("clientdabell: item message takes %s", sig.c_str());
     }
     try {
         G.pvRpc[pv](CreateMonoString("RpcCreateItem"), 0, args);      // 0 = everyone in the room
@@ -1315,7 +1368,7 @@ static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, 
         auto *ex = w.ex;
         auto *msg = ex ? (BNM::Structures::Mono::String *)ex->message : nullptr;
         auto *cls = ex ? (BNM::Structures::Mono::String *)ex->className : nullptr;
-        ym::log("starter-menu: item message error %s: %s", cls ? cls->str().c_str() : "?", msg ? msg->str().c_str() : "?");
+        ym::log("clientdabell: item message error %s: %s", cls ? cls->str().c_str() : "?", msg ? msg->str().c_str() : "?");
         return false;
     }
     return true;
@@ -1334,7 +1387,7 @@ static void ItemQueueTick() {
         g_itemQueue.erase(g_itemQueue.begin());
         bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel);
         static int logged = 0;
-        if (logged++ < 3) ym::log("starter-menu: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
+        if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
         if (!ok) { g_itemQueue.clear(); Notify("Item spawning isn't ready in this room"); }
     }
 }
@@ -1390,13 +1443,257 @@ static void SpawnOnHandTick(const Buttons &in) {
     g_itemQueue.push_back({G.trGetPosition[hand]() + G.trGetForward[hand]() * 0.1f, Vector3(0, 0, 0)});
 }
 
+// ---- soundboard: songs you copy onto the headset ----------------------------------------
+// Put .wav files in a folder named "sounds" next to the .so files in the mods folder
+// (Android/data/com.TrassGames.Yeeps/files/mods/sounds/). Open Soundboard, pick a song, press
+// Play. Only you hear it: it plays on an audio source on your head, nothing is sent.
+// WAV only (PCM 8/16/24/32-bit or 32-bit float). The song is read a little each frame, so
+// the game never stalls, and mixed down to mono to save memory.
+static constexpr int kMaxSongs = 64;
+static constexpr uint64_t kMaxFrames = 12000000;       // about 4.5 minutes at 44.1 kHz
+static constexpr uint32_t kChunkFrames = 32768;        // frames read per game frame
+static std::vector<std::string> g_songs;
+static int g_songSel = 0, g_soundVol = 1, g_clipSong = -1;
+static const float kSoundVols[] = {0.3f, 0.6f, 1.0f};
+static const char *kSoundVolNames[] = {"quiet", "medium", "loud"};
+static Ref g_audioGo, g_audioSrc, g_clip, g_chunk;
+
+struct Loader {
+    FILE *f = nullptr;
+    int channels = 0, bits = 0, fmt = 0;               // fmt 1 = whole numbers, 3 = floating point
+    uint32_t rate = 0, block = 0;
+    uint64_t frames = 0, done = 0;
+    int song = -1, lastTen = -1;
+    bool playWhenDone = false;
+    std::vector<uint8_t> buf;
+} g_load;
+
+static uint32_t U32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint16_t U16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+
+static std::string SongsDir() {
+    const char *base = ym::api()->modsDir;
+    return std::string(base ? base : "") + "/sounds";
+}
+static std::string SongTitle(int i) {
+    if (i < 0 || i >= (int)g_songs.size()) return "";
+    std::string n = g_songs[i];
+    return n.size() > 4 ? n.substr(0, n.size() - 4) : n;
+}
+static void UpdateSoundLabel() {
+    if (g_songs.empty()) snprintf(g_soundLabel, sizeof g_soundLabel, "Play: (no songs)");
+    else snprintf(g_soundLabel, sizeof g_soundLabel, "Play %d/%d: %.14s", g_songSel + 1, (int)g_songs.size(), SongTitle(g_songSel).c_str());
+    g_dirty = true;
+}
+static void ScanSongs() {
+    g_songs.clear();
+    g_songSel = 0;
+    std::string dir = SongsDir();
+    DIR *d = opendir(dir.c_str());
+    if (!d) {
+        ym::log("clientdabell: no sounds folder at %s", dir.c_str());
+        UpdateSoundLabel();
+        Notify("Make a folder called sounds in your mods folder");
+        return;
+    }
+    while (struct dirent *e = readdir(d)) {
+        std::string n = e->d_name;
+        if (n.size() > 4 && strcasecmp(n.c_str() + n.size() - 4, ".wav") == 0 && (int)g_songs.size() < kMaxSongs) g_songs.push_back(n);
+    }
+    closedir(d);
+    std::sort(g_songs.begin(), g_songs.end());
+    UpdateSoundLabel();
+    ym::log("clientdabell: found %d songs", (int)g_songs.size());
+    Notify(g_songs.empty() ? "No .wav files in the sounds folder" : "%d songs found", (int)g_songs.size());
+}
+
+// Reads the WAV header and leaves the file positioned at the first sample.
+static bool OpenWav(const std::string &path, Loader &L, const char **err) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) { *err = "Couldn't open that file"; return false; }
+    uint8_t h[12];
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) != 0 || memcmp(h + 8, "WAVE", 4) != 0) {
+        fclose(f); *err = "That isn't a WAV file"; return false;
+    }
+    bool haveFmt = false, haveData = false;
+    uint32_t dataBytes = 0;
+    long dataStart = 0;
+    uint8_t ch[8];
+    while (fread(ch, 1, 8, f) == 8) {
+        uint32_t size = U32(ch + 4);
+        if (memcmp(ch, "fmt ", 4) == 0) {
+            uint8_t fm[40] = {};
+            size_t n = size < 40 ? size : 40;
+            if (fread(fm, 1, n, f) != n || n < 16) break;
+            L.fmt = U16(fm);
+            L.channels = U16(fm + 2);
+            L.rate = U32(fm + 4);
+            L.bits = U16(fm + 14);
+            if (L.fmt == 0xFFFE && n >= 26) L.fmt = U16(fm + 24);     // "extensible": real format inside
+            haveFmt = true;
+            if (size > n || (size & 1)) fseek(f, (long)(size - n) + (long)(size & 1), SEEK_CUR);
+        } else if (memcmp(ch, "data", 4) == 0) {
+            dataBytes = size;
+            dataStart = ftell(f);
+            haveData = true;
+            break;
+        } else {
+            fseek(f, (long)size + (long)(size & 1), SEEK_CUR);
+        }
+    }
+    if (!haveFmt || !haveData) { fclose(f); *err = "Couldn't read that WAV"; return false; }
+    bool okFmt = (L.fmt == 1 && (L.bits == 8 || L.bits == 16 || L.bits == 24 || L.bits == 32)) || (L.fmt == 3 && L.bits == 32);
+    if (!okFmt || L.channels < 1 || L.channels > 8 || L.rate < 8000 || L.rate > 192000) {
+        fclose(f); *err = "Unsupported WAV (use 16-bit PCM)"; return false;
+    }
+    L.block = (uint32_t)L.channels * (uint32_t)(L.bits / 8);
+    fseek(f, 0, SEEK_END);
+    long fileEnd = ftell(f);
+    if (dataBytes == 0 || dataBytes == 0xFFFFFFFFu || dataStart + (long)dataBytes > fileEnd) dataBytes = (uint32_t)(fileEnd - dataStart);
+    fseek(f, dataStart, SEEK_SET);
+    L.frames = dataBytes / L.block;
+    L.f = f;
+    return true;
+}
+
+static void AbortLoad() {
+    if (g_load.f) fclose(g_load.f);
+    g_load.f = nullptr;
+    g_load.buf.clear();
+    g_load.buf.shrink_to_fit();
+    g_chunk.clear();
+}
+
+static bool EnsureAudioSource() {
+    if (Alive(g_audioGo.get()) && Alive(g_audioSrc.get())) return true;
+    if (!G.tAudioSource || !G.asPlay.IsValid() || !G.asSetClip.IsValid() || !g_head.get()) return false;
+    Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellAudio"));
+    Il2CppObject *src = go ? G.goAddComponent[go](G.tAudioSource) : nullptr;
+    if (!src) return false;
+    Il2CppObject *t = Tr(go);
+    G.trSetParent[t](g_head.get(), false);
+    G.trSetLocalPosition[t](Vector3(0, 0, 0));
+    g_audioGo.set(go);
+    g_audioSrc.set(src);
+    return true;
+}
+
+static void PlayLoaded() {
+    if (!EnsureAudioSource() || !Alive(g_clip.get())) { Notify("Couldn't start the sound"); return; }
+    Il2CppObject *src = g_audioSrc.get();
+    G.asSetClip[src](g_clip.get());
+    if (G.asSetVolume.IsValid()) G.asSetVolume[src](kSoundVols[g_soundVol]);
+    if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);          // 2D: heard in your head, wherever you walk
+    if (G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
+    G.asPlay[src]();
+    Notify("Playing %.30s", SongTitle(g_clipSong).c_str());
+}
+
+static void StartLoad(int song, bool playAfter) {
+    if (!G.audioClipCreate.IsValid() || !G.audioClipSetData.IsValid() || !G.arrayNew || !G.floatClass) {
+        ym::log("clientdabell: soundboard missing: create=%d setdata=%d array=%d", G.audioClipCreate.IsValid(), G.audioClipSetData.IsValid(), G.arrayNew != nullptr);
+        Notify("Soundboard isn't available in this game");
+        return;
+    }
+    Loader L;
+    const char *err = "";
+    if (!OpenWav(SongsDir() + "/" + g_songs[song], L, &err)) { Notify("%s", err); return; }
+    if (L.frames == 0) { fclose(L.f); Notify("That song is empty"); return; }
+    if (L.frames > kMaxFrames) { fclose(L.f); Notify("Song too long (max about 4 minutes)"); return; }
+    if (Alive(g_clip.get())) G.destroy(g_clip.get());               // frees the last song's memory
+    g_clip.clear();
+    g_clipSong = -1;
+    Il2CppObject *clip = G.audioClipCreate(CreateMonoString(SongTitle(song).c_str()), (int)L.frames, 1, (int)L.rate, false);
+    Il2CppObject *chunk = (Il2CppObject *)G.arrayNew(G.floatClass, kChunkFrames);
+    if (!clip || !chunk) { fclose(L.f); Notify("Not enough memory for that song"); return; }
+    g_clip.set(clip);
+    g_chunk.set(chunk);
+    L.buf.resize((size_t)kChunkFrames * L.block);
+    L.song = song;
+    L.playWhenDone = playAfter;
+    g_load = std::move(L);
+    ym::log("clientdabell: loading %s (%llu frames, %d ch, %d bit, %u Hz)", g_songs[song].c_str(), (unsigned long long)g_load.frames,
+            g_load.channels, g_load.bits, g_load.rate);
+    Notify("Loading %.30s", SongTitle(song).c_str());
+}
+
+// Called every frame: reads the next slice of the song into the clip (about 32k frames).
+static void LoadTick() {
+    Loader &L = g_load;
+    if (!L.f) return;
+    Il2CppObject *clip = g_clip.get();
+    if (!Alive(clip)) { AbortLoad(); return; }
+    uint64_t want = L.frames - L.done < kChunkFrames ? L.frames - L.done : kChunkFrames;
+    size_t got = fread(L.buf.data(), 1, (size_t)(want * L.block), L.f);
+    uint64_t n = got / L.block;
+    if (n > 0) {
+        Il2CppObject *arr = n == kChunkFrames ? g_chunk.get() : (Il2CppObject *)G.arrayNew(G.floatClass, (uintptr_t)n);
+        if (!arr) { AbortLoad(); Notify("Not enough memory for that song"); return; }
+        float *dst = (float *)((uint8_t *)arr + 0x20);
+        const int bytes = L.bits / 8;
+        const float inv = 1.0f / (float)L.channels;
+        for (uint64_t i = 0; i < n; i++) {
+            const uint8_t *p = L.buf.data() + i * L.block;
+            float sum = 0;
+            for (int c = 0; c < L.channels; c++) {
+                const uint8_t *q = p + c * bytes;
+                float v;
+                if (L.fmt == 3) { uint32_t u = U32(q); memcpy(&v, &u, 4); }
+                else if (L.bits == 16) v = (float)(int16_t)U16(q) * (1.0f / 32768.0f);
+                else if (L.bits == 24) v = (float)(int32_t)(((uint32_t)q[0] << 8) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 24)) * (1.0f / 2147483648.0f);
+                else if (L.bits == 32) v = (float)(int32_t)U32(q) * (1.0f / 2147483648.0f);
+                else v = ((float)q[0] - 128.0f) * (1.0f / 128.0f);
+                sum += v;
+            }
+            dst[i] = sum * inv;
+        }
+        G.audioClipSetData[clip](arr, (int)L.done);
+        L.done += n;
+        int ten = (int)(L.done * 10 / L.frames);
+        if (ten != L.lastTen && ten < 10) { L.lastTen = ten; Notify("Loading %d%%", ten * 10); }
+    }
+    if (n < want || L.done >= L.frames) {                            // finished (or the file ended early)
+        bool play = L.playWhenDone;
+        int song = L.song;
+        AbortLoad();
+        g_clipSong = song;
+        if (play) PlayLoaded();
+    }
+}
+
+static void PlaySong() {
+    if (g_songs.empty()) { Notify("Put .wav files in the sounds folder, then Rescan"); return; }
+    if (g_load.f) { Notify("Still loading, one moment"); return; }
+    if (g_clipSong == g_songSel && Alive(g_clip.get())) PlayLoaded();
+    else StartLoad(g_songSel, true);
+}
+static void NextSong() { if (g_songs.empty()) return; g_songSel = (g_songSel + 1) % (int)g_songs.size(); UpdateSoundLabel(); }
+static void PrevSong() { if (g_songs.empty()) return; g_songSel = (g_songSel + (int)g_songs.size() - 1) % (int)g_songs.size(); UpdateSoundLabel(); }
+static void StopSound() {
+    AbortLoad();
+    if (g_clipSong < 0 && Alive(g_clip.get())) { G.destroy(g_clip.get()); g_clip.clear(); }   // a half-loaded clip is useless
+    Il2CppObject *src = g_audioSrc.get();
+    if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
+}
+static void ApplyLoop() {
+    Il2CppObject *src = g_audioSrc.get();
+    if (Alive(src) && G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
+}
+static void NextSoundVolume() {
+    g_soundVol = (g_soundVol + 1) % 3;
+    Il2CppObject *src = g_audioSrc.get();
+    if (Alive(src) && G.asSetVolume.IsValid()) G.asSetVolume[src](kSoundVols[g_soundVol]);
+    Notify("Sound volume: %s", kSoundVolNames[g_soundVol]);
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
-    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo}) Kill(*r);
+    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo, &g_audioGo}) Kill(*r);
+    g_audioSrc.clear();
     PauseTrackers(false);
     g_dancing = false;
     g_gunLine.clear();
@@ -1452,13 +1749,15 @@ static void OnUpdate(float dt) {
     NoclipTick(in);
     TeleportGunTick(in);
     try { SpawnOnHandTick(in); ItemQueueTick(); }
-    catch (...) { g_itemQueue.clear(); ym::log("starter-menu: item code error"); }
+    catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
+    try { LoadTick(); }
+    catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
     DanceTick(in, dt);              // last: it moves your hands after everything else
 }
 
 YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     if (!ym::init(api)) return -1;
     ym::onUpdate(OnUpdate);
-    ym::log("Blaze Menu loaded on %s (%s)", api->gameVersion, api->buildId);
+    ym::log("ClientDaBell loaded on %s (%s)", api->gameVersion, api->buildId);
     return 0;
 }
