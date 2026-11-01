@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.0"
+#define CDB_VERSION "v1.2.1"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -296,7 +296,8 @@ static bool Lookups() {
                 MethodBase hasChar = fc.IsValid() ? Overload(fc, "HasCharacter", {"System.Char"}) : MethodBase();
                 if (good && hasChar.IsValid()) {
                     Method<bool> hc = hasChar;
-                    good = hc[fo]((uint16_t)'A');                // a font that can't draw an A didn't load
+                    bool hasA = hc[fo]((uint16_t)'A');
+                    ym::log("clientdabell: Londrina Solid object created, HasCharacter(A)=%d", (int)hasA);   // not used as a gate: it can read false before first use
                 }
                 if (good) { G.font.set(fo); g_customFont = true; }
                 ym::log("clientdabell: Londrina Solid font %s", good ? "loaded" : "failed, using the game's font");
@@ -575,7 +576,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Jump Power", "Small, medium, big or huge jump."},
     {"Super Fly", "Hold A to rocket where you look."},
     {"Rocket Boots", "Hold both triggers to shoot upward."},
-    {"Grapple Hook", "Hold left trigger to swing toward what you point at."},
+    {"Grapple Hook", "Hold either trigger (or both) to swing toward what that hand points at."},
     {"Ground Pound", "Press both grips to slam down."},
     {"Big Hands", "Your hands get a lot bigger. Held items grow too."},
     {"Turn Overpowered Off", "Switches every Overpowered mod off."},
@@ -611,6 +612,7 @@ static const Theme &T() { return kThemes[g_theme]; }
 // on a "board" object: +x goes across, +y goes up, the player looks at it from -z.
 static constexpr int kRows = 8;                                   // buttons per page
 static const float kBoardW = 0.30f, kBoardH = 0.3825f, kBtnW = 0.27f, kBtnH = 0.0306f;
+static const float kHomeY = -0.2175f, kHomeW = 0.12f, kHomeH = 0.032f;   // Home button just under the board
 static const float kTitleY = 0.235f, kSideX = 0.2f, kSideW = 0.06f, kSideH = 0.344f;
 static float RowY(int r) { return 0.13f - r * 0.04f; }
 
@@ -625,6 +627,7 @@ static int g_page = 0;
 static std::vector<Item *> g_view;                                // what the current page list shows
 static double g_time = 0, g_nextPress = 0, g_notifyUntil = 0, g_nextTitle = 0;
 static int g_touching = -2, g_frames = 0;
+static Ref g_homeCube, g_homeLabel;
 static float g_fps = 0;
 
 static int PageCount() { return g_view.empty() ? 1 : (int)(g_view.size() + kRows - 1) / kRows; }
@@ -797,6 +800,7 @@ static void BuildMenu() {
     // The title sits on its own dark bar above the board (where ii's Disconnect button was)
     g_titleBar.set(Part(bt, T().buttonOn, Vector3(0, kTitleY, -0.002f), Vector3(kBtnW, 0.045f, 0.009f)));
     g_next.set(Part(bt, T().button, Vector3(kSideX, 0, 0), Vector3(kSideW, kSideH, 0.009f)));
+    g_homeCube.set(Part(bt, T().button, Vector3(0, kHomeY, -0.005f), Vector3(kHomeW, kHomeH, 0.009f)));
 
     if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), kBoardW + 2 * kSideX, kBoardH + 0.1f)) {
         Il2CppObject *ct = Tr(canvas);
@@ -805,7 +809,8 @@ static void BuildMenu() {
             g_rowLabel[r].set(Label(ct, "", Vector3(0, RowY(r), 0), kBtnW, kBtnH, 19, &g_rowText[r]));
         Label(ct, "<", Vector3(-kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
-        Label(ct, "", Vector3(0, -kBoardH / 2 - 0.05f, 0), kBoardW, 0.03f, 17, &g_tipText);
+        g_homeLabel.set(Label(ct, "Home", Vector3(0, kHomeY, 0), kHomeW, kHomeH, 19, nullptr));
+        Label(ct, "", Vector3(0, -kBoardH / 2 - 0.09f, 0), kBoardW, 0.03f, 17, &g_tipText);
         Label(ct, CDB_VERSION, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
     }
     BuildDecor(bt);
@@ -859,6 +864,9 @@ static void RenderPage() {
     Show(g_next, pages);
     SetColor(g_prev.get(), T().button);
     SetColor(g_next.get(), T().button);
+    Show(g_homeCube, g_cat != MAIN);
+    Show(g_homeLabel, g_cat != MAIN);
+    SetColor(g_homeCube.get(), g_flashRow == -3 ? Color(1, 0.9f, 0.6f, 1) : T().button);
     SetColor(g_outline.get(), T().title);
     SetColor(g_titleBar.get(), T().buttonOn);
     SetColor(g_pointer.get(), T().bgB);
@@ -963,6 +971,7 @@ static int Touching() {
     if (!Alive(board) || !Alive(pointer)) return -2;
     Vector3 p = G.trInverseTransformPoint[Tr(board)](G.trGetPosition[Tr(pointer)]());
     if (p.z < -0.035f || p.z > 0.015f) return -2;
+    if (g_cat != MAIN && fabsf(p.x) < kHomeW / 2 && fabsf(p.y - kHomeY) < kHomeH / 2) return -3;
     if (fabsf(fabsf(p.x) - kSideX) < kSideW / 2 && fabsf(p.y) < kSideH / 2 && PageCount() > 1)
         return p.x < 0 ? -1 : kRows;
     if (fabsf(p.x) >= kBtnW / 2) return -2;
@@ -988,7 +997,12 @@ static void CheckPress() {
         g_nextPress = g_time + 0.25;
         Buzz();
         if (hit >= 0 && hit < kRows) { g_flashRow = hit; g_flashUntil = g_time + 0.12; }
-        if (hit == -1 || hit == kRows) {
+        if (hit == -3) {                                  // Home: back to the main page
+            g_cat = MAIN;
+            g_page = 0;
+            g_flashRow = -3; g_flashUntil = g_time + 0.12;
+            g_dirty = true;
+        } else if (hit == -1 || hit == kRows) {
             int n = PageCount();
             g_page = (g_page + (hit == kRows ? 1 : n - 1)) % n;
             g_dirty = true;
@@ -2142,6 +2156,7 @@ static bool ReadController(int node, Il2CppObject *hand, int &space, Vector3 &po
     if (space < 0) space = best;
     return true;
 }
+static bool g_laStretch = false;               // fallback: stretch the hand from where the trackers just put it
 static void LongArmsFail(const char *why) {
     g_laState = 3;
     if (g_laOwns && !g_dancing) PauseTrackers(false);
@@ -2159,13 +2174,22 @@ static void LongArmsTick() {
         if (!f_longArms) g_laState = 0;
         return;
     }
-    if (!LaInit() || !G.trTransformPoint.IsValid() || !G.trGetParent.IsValid() || !G.trGetRotation.IsValid()) { LongArmsFail("input functions missing"); return; }
     Vector3 pl, pr;
     Quaternion ql, qr;
+    if (!g_laStretch && (!LaInit() || !G.trTransformPoint.IsValid() || !G.trGetParent.IsValid() || !G.trGetRotation.IsValid())) {
+        g_laStretch = true;
+        ym::log("clientdabell: long arms: controller input not available, using stretch mode");
+    }
+    if (g_laStretch) {                                             // the trackers place the hands each frame; push them outward from the chest
+        Vector3 chest = G.trGetPosition[head]() + Vector3(0, -0.25f, 0);
+        float k = kArmScales[g_armScale];
+        for (Il2CppObject *h : {lh, rh}) G.trSetPosition[h](chest + (G.trGetPosition[h]() - chest) * k);
+        return;
+    }
     if (g_laState < 2) {                                           // trackers still on: find out how to read the controllers
         bool okL = ReadController(4, lh, g_laSpaceL, pl, ql), okR = ReadController(5, rh, g_laSpaceR, pr, qr);
         if (okL && okR) { g_laState = 2; ym::log("clientdabell: long arms ready (spaces %d/%d)", g_laSpaceL, g_laSpaceR); }
-        else if (++g_laChecks > 60) LongArmsFail("controller positions don't match the hands");
+        else if (++g_laChecks > 60) { g_laStretch = true; ym::log("clientdabell: long arms: controller positions don't match the hands, using stretch mode"); }
         return;
     }
     if (g_pausedN == 0 && g_time >= g_laNextPause) {               // pause the trackers (retry twice a second)
@@ -2227,29 +2251,27 @@ static void GroundPoundTick(const Buttons &in) {
     SetVel(Vector3(0, -35.0f, 0));
 }
 
-// Grapple Hook: hold the left trigger and a rope pulls you toward the spot you point at.
-static Ref g_grappleGo, g_grappleLine;
-static bool g_grappling = false, g_grapplePrev = false;
-static Vector3 g_grapplePoint;
-static void GrappleTick(const Buttons &in, float dt) {
-    Il2CppObject *hand = g_leftHand.get();
-    bool held = f_grapple && in.ltrig && g_dance < 0 && !g_menuShown && hand && G.raycast.IsValid() && G.lrSetPosition.IsValid();
-    bool press = held && !g_grapplePrev;
-    g_grapplePrev = in.ltrig;
+// Grapple Hook: hold a trigger (either hand, or both) and a rope pulls you toward the spot that hand points at.
+struct Grapple { Ref go, line; bool on = false, prev = false; Vector3 point; };
+static Grapple g_grap[2];
+static void GrappleHand(Grapple &g, Il2CppObject *hand, bool trig, float dt, Vector3 &pull) {
+    bool held = f_grapple && trig && g_dance < 0 && !g_menuShown && hand && G.raycast.IsValid() && G.lrSetPosition.IsValid();
+    bool press = held && !g.prev;
+    g.prev = trig;
     if (!held) {
-        if (g_grappling) { g_grappling = false; Show(g_grappleGo, false); }
+        if (g.on) { g.on = false; Show(g.go, false); }
         return;
     }
     Vector3 start = G.trGetPosition[hand](), dir = G.trGetForward[hand]();
     if (press) {
         BNM::Structures::Unity::RaycastHit hit{};
         if (!G.raycast(start + dir * 0.25f, dir, &hit, 80.0f, -5)) return;
-        g_grapplePoint = hit.point;
-        g_grappling = true;
-        if (!g_grappleLine.get()) {                                // the rope is made once
+        g.point = hit.point;
+        g.on = true;
+        if (!g.line.get()) {                                       // each rope is made once
             Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellGrapple"));
             Il2CppObject *line = lineGo && G.tLine ? G.goAddComponent[lineGo](G.tLine) : nullptr;
-            if (!line) { g_grappling = false; return; }
+            if (!line) { g.on = false; return; }
             if (Il2CppObject *m = G.rendererGetMaterial[line]()) {
                 if (G.shader.get()) G.matSetShader[m](G.shader.get());
                 G.matSetColor[m](Color(1.0f, 1.0f, 1.0f, 1));
@@ -2258,22 +2280,30 @@ static void GrappleTick(const Buttons &in, float dt) {
             G.lrSetEndWidth[line](0.02f);
             G.lrSetPositionCount[line](2);
             G.lrSetUseWorldSpace[line](true);
-            g_grappleGo.set(lineGo);
-            g_grappleLine.set(line);
+            g.go.set(lineGo);
+            g.line.set(line);
         }
-        Show(g_grappleGo, true);
+        Show(g.go, true);
     }
-    Vector3 body, v;
-    if (!g_grappling || !BodyPos(body) || !GetVel(v) || !Alive(g_grappleLine.get())) return;
-    Vector3 to = g_grapplePoint - body;
+    Vector3 body;
+    if (!g.on || !BodyPos(body) || !Alive(g.line.get())) return;
+    Vector3 to = g.point - body;
     float dist = sqrtf(Dot(to, to));
-    if (dist < 1.5f) { g_grappling = false; Show(g_grappleGo, false); return; }   // arrived
-    v = v + to * (45.0f * dt / dist);
+    if (dist < 1.5f) { g.on = false; Show(g.go, false); return; }  // arrived
+    pull = pull + to * (45.0f * dt / dist);
+    G.lrSetPosition[g.line.get()](0, start);
+    G.lrSetPosition[g.line.get()](1, g.point);
+}
+static void GrappleTick(const Buttons &in, float dt) {
+    Vector3 v, pull(0, 0, 0);
+    GrappleHand(g_grap[0], g_leftHand.get(), in.ltrig, dt, pull);
+    GrappleHand(g_grap[1], g_rightHand.get(), in.rtrig, dt, pull);
+    if (!g_grap[0].on && !g_grap[1].on) return;
+    if (!GetVel(v)) return;
+    v = v + pull;                                                  // both ropes pull together
     float speed = sqrtf(Dot(v, v));
     if (speed > 28.0f) v = v * (28.0f / speed);
     SetVel(v);
-    G.lrSetPosition[g_grappleLine.get()](0, start);
-    G.lrSetPosition[g_grappleLine.get()](1, g_grapplePoint);
 }
 
 // Big Hands: both hands are scaled up and put back afterwards.
@@ -2312,9 +2342,7 @@ static void OverpoweredTick(const Buttons &in, float dt) {
     LongArmsTick();
 }
 static void OverpoweredReset() {                               // room change: the old objects are gone
-    Kill(g_grappleGo);
-    g_grappleLine.clear();
-    g_grappling = g_grapplePrev = false;
+    for (auto &g : g_grap) { Kill(g.go); g.line.clear(); g.on = g.prev = false; }
     g_bigApplied = false;
     g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; g_laOwns = false;
     g_megaPrev = g_poundPrev = false;
