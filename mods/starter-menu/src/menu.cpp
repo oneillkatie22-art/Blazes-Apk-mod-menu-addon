@@ -71,6 +71,7 @@ static Color Rainbow(float h) {             // hue 0..1 -> bright color
 // ---- game lookups, resolved once -------------------------------------------
 
 struct XRDevice { uint64_t id; bool initialized; };
+static bool g_customFont = false;       // Londrina Solid loaded from the fonts folder
 static struct {
     bool ok = false;
     Method<Il2CppObject *> createPrimitive, goTransform, goGetComponent, goAddComponent, compTransform, compGameObject;
@@ -280,6 +281,27 @@ static bool Lookups() {
     G.usageTrigger.set((Il2CppObject *)CreateMonoString("TriggerButton"));
     for (const char *s : {"Universal Render Pipeline/Unlit", "Universal Render Pipeline/Lit"})
         if (!G.shader.get() && G.shaderFind.IsValid()) G.shader.set(G.shaderFind((BNM::Structures::Mono::String *)CreateMonoString(s)));
+    // Londrina Solid: copy LondrinaSolid-Regular.ttf into a "fonts" folder next to the .so
+    // files (mods/fonts/). If it is missing or won't load, the game's own font is used.
+    {
+        std::string fpath = std::string(ym::api()->modsDir ? ym::api()->modsDir : "") + "/fonts/LondrinaSolid-Regular.ttf";
+        FILE *ff = fopen(fpath.c_str(), "rb");
+        if (ff) {
+            fclose(ff);
+            try {
+                Class fc("UnityEngine", "Font");
+                Il2CppObject *fo = fc.IsValid() ? fc.CreateNewObjectParameters(CreateMonoString(fpath.c_str())) : nullptr;
+                bool good = fo && G.alive((Il2CppObject *)fo);
+                MethodBase hasChar = fc.IsValid() ? Overload(fc, "HasCharacter", {"System.Char"}) : MethodBase();
+                if (good && hasChar.IsValid()) {
+                    Method<bool> hc = hasChar;
+                    good = hc[fo]((uint16_t)'A');                // a font that can't draw an A didn't load
+                }
+                if (good) { G.font.set(fo); g_customFont = true; }
+                ym::log("clientdabell: Londrina Solid font %s", good ? "loaded" : "failed, using the game's font");
+            } catch (...) { ym::log("clientdabell: Londrina Solid font error, using the game's font"); }
+        } else ym::log("clientdabell: no font file at %s, using the game's font", fpath.c_str());
+    }
     // Arial, like ii's menu (Unity 6 calls it LegacyRuntime.ttf)
     for (const char *f : {"LegacyRuntime.ttf", "Arial.ttf"})
         if (!G.font.get() && G.builtinResource.IsValid() && G.tFont)
@@ -355,6 +377,8 @@ static int g_dupeArmed = 0;
 
 static constexpr int kDances = 8;
 static bool g_danceSel[kDances];
+static bool g_wxSel[3];             // Effects: Snow, Rain, Thunderstorm (pick one, like the dances)
+static int g_wx = -1;
 static int g_dance = -1;            // the picked dance, -1 = none
 static bool f_fly, f_fastFly, f_platforms, f_lowGravity, f_rainbow, f_fps, f_clock, f_rightHand,
             f_notify = true;
@@ -384,9 +408,11 @@ static void PrevSong();
 static void StopSound();
 static void ApplyLoop();
 static void NextSoundVolume();
+static void WeatherPicked();
+static void NextWeatherIntensity();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, SETTINGS, ENABLED, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Settings", "Enabled Mods"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, SETTINGS, ENABLED, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Settings", "Enabled Mods"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -403,6 +429,7 @@ static Item g_items[] = {
     {MAIN, "Rig Mods", OPEN, RIG},
     {MAIN, "Items", OPEN, ITEMS},
     {MAIN, "Soundboard", OPEN, SOUNDBOARD},
+    {MAIN, "Effects", OPEN, EFFECTS},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
@@ -446,6 +473,12 @@ static Item g_items[] = {
     {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
     {SOUNDBOARD, "Rescan Songs", ACTION, MAIN, nullptr, ScanSongs},
 
+    {EFFECTS, "Exit Effects", OPEN, MAIN},
+    {EFFECTS, "Snow", TOGGLE, MAIN, &g_wxSel[0], WeatherPicked},
+    {EFFECTS, "Rain", TOGGLE, MAIN, &g_wxSel[1], WeatherPicked},
+    {EFFECTS, "Thunderstorm", TOGGLE, MAIN, &g_wxSel[2], WeatherPicked},
+    {EFFECTS, "Effect Intensity", ACTION, MAIN, nullptr, NextWeatherIntensity},
+
     {SETTINGS, "Exit Settings", OPEN, MAIN},
     {SETTINGS, "Change Pointer Position", ACTION, MAIN, nullptr, NextPointer},
     {SETTINGS, "Iron Man Speed", ACTION, MAIN, nullptr, NextIronSpeed},
@@ -480,7 +513,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Low Gravity", "Jump higher, fall slower."},
     {"Save Spot", "Remembers where you are."},
     {"Go To Spot", "Teleports you to your saved spot."},
-    {"Change Menu Theme", "ClientDaBell, Orange, Blue, Green, Purple, Dark."},
+    {"Change Menu Theme", "Plush Blue, Orange, Blue, Green, Purple, Dark."},
     {"Rainbow Menu", "The menu cycles through colors."},
     {"Show FPS", "Frames per second in the title."},
     {"Show Clock", "The time in the title."},
@@ -505,6 +538,11 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Loop", "Repeats the song until you stop it."},
     {"Sound Volume", "Quiet, medium or loud."},
     {"Rescan Songs", "Looks in the sounds folder again."},
+    {"Effects", "Snow, rain and thunderstorms. Only you see and hear them."},
+    {"Snow", "Snow falls around you."},
+    {"Rain", "Rain falls around you."},
+    {"Thunderstorm", "Rain with lightning and thunder."},
+    {"Effect Intensity", "Light, medium or heavy."},
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
@@ -520,7 +558,7 @@ static const char *TipFor(const char *label) {
 // Colors in the ii menu style: an animated background and darker buttons when on.
 struct Theme { const char *name; Color bgA, bgB, button, buttonOn, title; };
 static const Theme kThemes[] = {
-    {"ClientDaBell",  Color(0.90f, 0.12f, 0.04f, 1), Color(1.0f, 0.42f, 0.0f, 1), Color(0.50f, 0.06f, 0.03f, 1), Color(1.0f, 0.45f, 0.05f, 1), Color(1.0f, 0.62f, 0.20f, 1)},
+    {"Plush Blue", Color(0.25f, 0.55f, 0.95f, 1), Color(0.42f, 0.72f, 1.0f, 1), Color(0.13f, 0.33f, 0.70f, 1), Color(0.05f, 0.15f, 0.42f, 1), Color(0.82f, 0.93f, 1.0f, 1)},
     {"Orange", Color(1.0f, 0.50f, 0.0f, 1), Color(1.0f, 0.40f, 0.0f, 1), Color(0.67f, 0.33f, 0.0f, 1), Color(0.33f, 0.16f, 0.0f, 1), Color(1.0f, 0.75f, 0.49f, 1)},
     {"Blue",   Color(0.20f, 0.50f, 1.0f, 1), Color(0.10f, 0.30f, 0.85f, 1), Color(0.10f, 0.28f, 0.65f, 1), Color(0.04f, 0.12f, 0.32f, 1), Color(0.70f, 0.85f, 1.0f, 1)},
     {"Green",  Color(0.30f, 0.85f, 0.30f, 1), Color(0.15f, 0.65f, 0.20f, 1), Color(0.12f, 0.45f, 0.12f, 1), Color(0.05f, 0.22f, 0.05f, 1), Color(0.75f, 1.0f, 0.75f, 1)},
@@ -581,7 +619,7 @@ static Il2CppObject *Label(Il2CppObject *canvasT, const char *s, Vector3 pos, fl
     G.textSetText[text](CreateMonoString(s));
     G.textSetFontSize[text](size);
     G.textSetAlignment[text](4);                 // MiddleCenter
-    if (G.textSetFontStyle.IsValid()) G.textSetFontStyle[text](2);   // Italic, like ii's menu
+    if (G.textSetFontStyle.IsValid()) G.textSetFontStyle[text](g_customFont ? 0 : 2);   // Londrina is already chunky; the fallback font is italic
     if (G.textSetBestFit.IsValid()) {            // shrink long labels to fit their button
         G.textSetBestFit[text](true);
         G.textSetMinSize[text](1);
@@ -633,6 +671,73 @@ static void PointerToHand() {
 }
 static void NextPointer() { g_pointerSpot = (g_pointerSpot + 1) % 4; PointerToHand(); Notify("Pointer position %d", g_pointerSpot + 1); }
 
+// ---- Yeeps decorations: candy-cane border, candy canes, pumpkins ------------------------
+// Plain primitives with no colliders, parented to the board, built once with the menu and
+// destroyed with it. A hard cap (kMaxDecor) keeps the object count fixed.
+static constexpr int kMaxDecor = 72;
+static int g_decorN = 0;
+static Quaternion RotZ(float rad) { return Quaternion(0, 0, sinf(rad * 0.5f), cosf(rad * 0.5f)); }
+// prim: 0 sphere, 2 cylinder, 3 cube. Positions are in the board's own space.
+static void Decor(Il2CppObject *boardT, int prim, Color c, Vector3 pos, Vector3 scale, float roll = 0) {
+    if (g_decorN >= kMaxDecor) return;
+    Il2CppObject *o = Prim(prim, c, false);
+    if (!o) return;
+    g_decorN++;
+    Il2CppObject *t = Tr(o);
+    G.trSetParent[t](boardT, false);
+    G.trSetLocalPosition[t](pos);
+    G.trSetLocalRotation[t](RotZ(roll));
+    G.trSetLocalScale[t](scale);
+}
+static void CandyCane(Il2CppObject *bt, float x, float y, float dir) {      // dir +1: the hook bends toward +x
+    const Color white(0.97f, 0.97f, 1.0f, 1), red(0.85f, 0.10f, 0.12f, 1);
+    const float z = -0.02f, h = 0.08f, d = 0.012f, R = 0.014f;
+    Decor(bt, 2, white, Vector3(x, y, z), Vector3(d, h / 2, d));
+    for (int i = 0; i < 3; i++)
+        Decor(bt, 2, red, Vector3(x, y - 0.024f + i * 0.024f, z), Vector3(d * 1.07f, 0.005f, d * 1.07f));
+    const float top = y + h / 2;
+    for (int k = 1; k <= 4; k++) {                                         // the hook: half a circle of balls
+        float a = 3.14159265f * 0.25f * k;
+        Decor(bt, 0, k % 2 ? red : white, Vector3(x + dir * (R - R * cosf(a)), top + R * sinf(a), z), Vector3(d, d, d));
+    }
+}
+static void Pumpkin(Il2CppObject *bt, float x, float y) {
+    const Color orange(1.0f, 0.45f, 0.05f, 1), dark(0.78f, 0.28f, 0.02f, 1), green(0.2f, 0.6f, 0.15f, 1), face(0.08f, 0.04f, 0.0f, 1);
+    const float z = -0.02f, front = z - 0.0245f;
+    Decor(bt, 0, dark, Vector3(x - 0.012f, y, z + 0.006f), Vector3(0.034f, 0.040f, 0.04f));      // ribs behind
+    Decor(bt, 0, dark, Vector3(x + 0.012f, y, z + 0.006f), Vector3(0.034f, 0.040f, 0.04f));
+    Decor(bt, 0, orange, Vector3(x, y, z), Vector3(0.05f, 0.042f, 0.05f));                       // body
+    Decor(bt, 3, green, Vector3(x + 0.002f, y + 0.025f, z), Vector3(0.008f, 0.014f, 0.008f), 0.3f);   // stem
+    Decor(bt, 3, face, Vector3(x - 0.010f, y + 0.005f, front), Vector3(0.008f, 0.008f, 0.004f), 0.785f);   // eyes
+    Decor(bt, 3, face, Vector3(x + 0.010f, y + 0.005f, front), Vector3(0.008f, 0.008f, 0.004f), 0.785f);
+    Decor(bt, 3, face, Vector3(x, y - 0.009f, front), Vector3(0.022f, 0.006f, 0.004f));          // mouth
+}
+static void BuildDecor(Il2CppObject *bt) {
+    g_decorN = 0;
+    const Color white(0.97f, 0.97f, 1.0f, 1), red(0.85f, 0.10f, 0.12f, 1);
+    const float hw = kBoardW / 2 + 0.004f, hh = kBoardH / 2 + 0.004f, bar = 0.008f, z = -0.002f;
+    // Candy-cane border: four white bars with red stripes across them
+    Decor(bt, 3, white, Vector3(0, hh, z), Vector3(kBoardW + 2 * bar, bar, 0.012f));
+    Decor(bt, 3, white, Vector3(0, -hh, z), Vector3(kBoardW + 2 * bar, bar, 0.012f));
+    Decor(bt, 3, white, Vector3(-hw, 0, z), Vector3(bar, kBoardH, 0.012f));
+    Decor(bt, 3, white, Vector3(hw, 0, z), Vector3(bar, kBoardH, 0.012f));
+    for (int i = 0; i < 6; i++) {
+        float x = -kBoardW / 2 + (i + 0.5f) * (kBoardW / 6);
+        Decor(bt, 3, red, Vector3(x, hh, z), Vector3(0.022f, bar * 1.05f, 0.0125f), 0.0f);
+        Decor(bt, 3, red, Vector3(x, -hh, z), Vector3(0.022f, bar * 1.05f, 0.0125f), 0.0f);
+    }
+    for (int i = 0; i < 8; i++) {
+        float y = -kBoardH / 2 + (i + 0.5f) * (kBoardH / 8);
+        Decor(bt, 3, red, Vector3(-hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
+        Decor(bt, 3, red, Vector3(hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
+    }
+    CandyCane(bt, -kSideX, kTitleY, 1);
+    CandyCane(bt, kSideX, kTitleY, -1);
+    Pumpkin(bt, -kSideX, -0.215f);
+    Pumpkin(bt, kSideX, -0.215f);
+    ym::log("clientdabell: %d decorations", g_decorN);
+}
+
 // Built once per room; afterwards only shown/hidden, moved and relabeled.
 static void BuildMenu() {
     auto NewObject = [](const char *name) {
@@ -664,11 +769,12 @@ static void BuildMenu() {
             g_rowLabel[r].set(Label(ct, "", Vector3(0, RowY(r), 0), kBtnW, kBtnH, 19, &g_rowText[r]));
         Label(ct, "<", Vector3(-kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
-        Label(ct, "", Vector3(0, -kBoardH / 2 - 0.02f, 0), kBoardW + 0.1f, 0.03f, 15, &g_tipText);
+        Label(ct, "", Vector3(0, -kBoardH / 2 - 0.05f, 0), kBoardW, 0.03f, 17, &g_tipText);
         char ver[64];
         snprintf(ver, sizeof ver, "ClientDaBell build %s", ym::api()->gameVersion);
         Label(ct, ver, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
     }
+    BuildDecor(bt);
     // Pointer: a small ball on the index finger of the other hand
     if (Il2CppObject *p = Prim(0, T().bgB, false)) {
         G.trSetLocalScale[Tr(p)](Vector3(0.01f, 0.01f, 0.01f));
@@ -729,12 +835,12 @@ static void RenderPage() {
 
 static int Hex(float v) { return (int)(v < 0 ? 0 : v > 1 ? 255 : v * 255); }
 
-// The title is "ClientDaBell" with a moving red-orange-yellow gradient, one color per letter
+// The title is "ClientDaBell" with a moving plush-blue gradient, one color per letter
 // (rich text). Rebuilt ten times a second, not every frame.
 static void UpdateTitle() {
     if (g_time < g_nextTitle) return;
     g_nextTitle = g_time + 0.1;
-    static const Color kFire[] = {Color(1, 0.1f, 0.05f, 1), Color(1, 0.45f, 0, 1), Color(1, 0.8f, 0.2f, 1), Color(1, 0.45f, 0, 1)};
+    static const Color kFire[] = {Color(0.20f, 0.50f, 1.0f, 1), Color(0.45f, 0.75f, 1.0f, 1), Color(0.85f, 0.95f, 1.0f, 1), Color(0.45f, 0.75f, 1.0f, 1)};   // plush blue shimmer
     char buf[1024];
     int n = 0;
     const char *word = "ClientDaBell";
@@ -929,6 +1035,7 @@ static void AllOff() {
     for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
     g_dupeArmed = 0;
+    g_wx = -1;
     StopSound();
     g_itemQueue.clear();
     PointerToHand();
@@ -1686,6 +1793,256 @@ static void NextSoundVolume() {
     Notify("Sound volume: %s", kSoundVolNames[g_soundVol]);
 }
 
+// ---- effects: snow, rain, thunderstorm (only you see and hear them) -----------------
+// Nothing here is sent to anyone. A fixed pool of small cubes (kMaxFx) falls around your
+// head and is reused: a piece that lands, or drifts too far away, restarts above you. The
+// pool is made a few pieces per frame, once, and is hidden (not destroyed) when you switch
+// the effect off. A thunderstorm adds a lightning bolt far away in the sky, a brief
+// dim flash of light, and a thunder rumble that is made from noise in code, once.
+static constexpr int kMaxFx = 100;
+static const int kFxCounts[3][3] = {{40, 70, 100}, {50, 80, 100}, {50, 80, 100}};   // [effect][intensity]
+static const char *kFxIntensityNames[] = {"light", "medium", "heavy"};
+static int g_wxIntensity = 1;
+static Ref g_wxRoot, g_fx[kMaxFx], g_fxT[kMaxFx], g_bolt[7], g_wxLight, g_wxAudioGo, g_wxAudioSrc, g_wxClip;
+static Vector3 g_fxPos[kMaxFx];
+static float g_fxPhase[kMaxFx];
+static int g_fxMade = 0, g_fxMode = -1, g_fxShown = -1;
+static float g_groundY = 0;
+static double g_nextGround = 0, g_nextBolt = 0, g_boltHideAt = 0, g_flashAt = 0, g_thunderAt = 0;
+static bool g_wxOn = false;
+static Method<void> g_lightType, g_lightIntensity, g_lightRange, g_lightColor;
+
+static void WeatherPicked() {
+    int picked = -1;
+    for (int i = 0; i < 3; i++) if (g_wxSel[i] && i != g_wx) picked = i;
+    for (int i = 0; i < 3; i++) g_wxSel[i] = (i == picked);
+    g_wx = picked;
+}
+static void NextWeatherIntensity() { g_wxIntensity = (g_wxIntensity + 1) % 3; Notify("Effect intensity: %s", kFxIntensityNames[g_wxIntensity]); }
+
+static bool EnsureWxRoot() {
+    if (Alive(g_wxRoot.get())) return true;
+    Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellWeather"));
+    if (!go) return false;
+    g_wxRoot.set(go);
+    return true;
+}
+static void RespawnFx(int i, Vector3 head, bool anywhere) {
+    float a = Rand01() * 6.2831853f, r = 4.0f * sqrtf(Rand01());
+    float top = head.y + 3.0f;
+    float y = anywhere ? g_groundY + Rand01() * (top - g_groundY) : head.y + 2.0f + Rand01() * 1.5f;
+    g_fxPos[i] = Vector3(head.x + cosf(a) * r, y, head.z + sinf(a) * r);
+    g_fxPhase[i] = Rand01() * 6.2831853f;
+}
+static void StyleFx(int i, int mode) {
+    Il2CppObject *o = g_fx[i].get(), *t = g_fxT[i].get();
+    if (!Alive(o) || !t) return;
+    if (mode == 0) { SetColor(o, Color(0.95f, 0.97f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.02f, 0.02f, 0.02f)); }
+    else           { SetColor(o, Color(0.65f, 0.78f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.004f, 0.07f, 0.004f)); }
+}
+
+// Thunder: low-passed noise with a quick attack and a long tail, plus a low thump.
+static void BuildThunderClip() {
+    if (Alive(g_wxClip.get()) || !G.audioClipCreate.IsValid() || !G.audioClipSetData.IsValid() || !G.arrayNew || !G.floatClass) return;
+    const int rate = 22050, n = rate * 3;
+    Il2CppObject *clip = G.audioClipCreate(CreateMonoString("ClientDaBellThunder"), n, 1, rate, false);
+    Il2CppObject *arr = (Il2CppObject *)G.arrayNew(G.floatClass, n);
+    if (!clip || !arr) return;
+    float *d = (float *)((uint8_t *)arr + 0x20);
+    float lp = 0, lp2 = 0;
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / rate, noise = Rand01() * 2 - 1;
+        lp += (noise - lp) * 0.04f;
+        lp2 += (lp - lp2) * 0.15f;
+        float env = t < 0.04f ? t / 0.04f : expf(-(t - 0.04f) * 1.3f);
+        float crack = t < 0.5f ? noise * 0.25f * expf(-t * 9.0f) : 0.0f;
+        float thump = sinf(6.2831853f * 48.0f * t) * 0.35f * expf(-t * 1.8f);
+        float v = (lp2 * 4.0f + thump * 0.7f + crack * 0.7f) * env;
+        d[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+    }
+    G.audioClipSetData[clip](arr, 0);
+    g_wxClip.set(clip);
+}
+static void PlayThunder() {
+    if (!Alive(g_wxClip.get()) || !G.tAudioSource || !G.asPlay.IsValid() || !g_head.get()) return;
+    if (!Alive(g_wxAudioGo.get()) || !Alive(g_wxAudioSrc.get())) {
+        Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellThunderAudio"));
+        Il2CppObject *src = go ? G.goAddComponent[go](G.tAudioSource) : nullptr;
+        if (!src) return;
+        G.trSetParent[Tr(go)](g_head.get(), false);
+        G.trSetLocalPosition[Tr(go)](Vector3(0, 0, 0));
+        g_wxAudioGo.set(go);
+        g_wxAudioSrc.set(src);
+    }
+    Il2CppObject *src = g_wxAudioSrc.get();
+    G.asSetClip[src](g_wxClip.get());
+    if (G.asSetVolume.IsValid()) G.asSetVolume[src](kSoundVols[g_soundVol]);
+    if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);
+    if (G.asSetLoop.IsValid()) G.asSetLoop[src](false);
+    G.asPlay[src]();
+}
+static void EnsureStorm() {
+    if (!EnsureWxRoot()) return;
+    if (!Alive(g_wxLight.get())) {
+        Class light("UnityEngine", "Light");
+        Il2CppObject *go = light.IsValid() ? Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellLightning")) : nullptr;
+        Il2CppObject *l = go ? G.goAddComponent[go](light.GetMonoType()) : nullptr;
+        if (l) {
+            g_lightType = light.GetMethod("set_type", 1);
+            g_lightIntensity = light.GetMethod("set_intensity", 1);
+            g_lightRange = light.GetMethod("set_range", 1);
+            g_lightColor = light.GetMethod("set_color", 1);
+            G.trSetParent[Tr(go)](Tr(g_wxRoot.get()), false);
+            if (g_lightType.IsValid()) g_lightType[l](2);                     // a point light
+            if (g_lightRange.IsValid()) g_lightRange[l](80.0f);
+            if (g_lightColor.IsValid()) g_lightColor[l](Color(0.8f, 0.85f, 1.0f, 1));
+            if (g_lightIntensity.IsValid()) g_lightIntensity[l](0.0f);
+            G.behaviourSetEnabled[l](false);
+            g_wxLight.set(l);
+        }
+    }
+    for (int i = 0; i < 7; i++) {
+        if (Alive(g_bolt[i].get())) continue;
+        Il2CppObject *o = Prim(3, Color(0.92f, 0.95f, 1.0f, 1), false);
+        if (!o) continue;
+        G.trSetParent[Tr(o)](Tr(g_wxRoot.get()), false);
+        G.goSetActive[o](false);
+        g_bolt[i].set(o);
+    }
+    BuildThunderClip();
+}
+static void StrikeBolt(Vector3 head) {
+    float ang = Rand01() * 6.2831853f, dist = 25.0f + Rand01() * 30.0f;
+    Vector3 base(head.x + cosf(ang) * dist, g_groundY, head.z + sinf(ang) * dist), pts[8];
+    float jx = 0, jz = 0;
+    for (int i = 0; i < 8; i++) {                       // a jagged line from the sky to the ground
+        float k = i / 7.0f;
+        if (i > 0 && i < 7) { jx += (Rand01() - 0.5f) * 7.0f; jz += (Rand01() - 0.5f) * 7.0f; }
+        pts[i] = Vector3(base.x + jx * (1 - k), base.y + (1 - k) * 45.0f, base.z + jz * (1 - k));
+    }
+    for (int i = 0; i < 7; i++) {
+        Il2CppObject *o = g_bolt[i].get();
+        if (!Alive(o)) continue;
+        Vector3 dv = pts[i + 1] - pts[i], mid = (pts[i] + pts[i + 1]) * 0.5f;
+        float len = sqrtf(dv.x * dv.x + dv.y * dv.y + dv.z * dv.z);
+        if (len < 0.01f) continue;
+        Il2CppObject *t = Tr(o);
+        G.trSetPosition[t](mid);
+        G.trSetRotation[t](Quaternion::LookRotation(dv));
+        G.trSetLocalScale[t](Vector3(0.8f, 0.8f, len));
+        G.goSetActive[o](true);
+    }
+    g_boltHideAt = g_time + 0.22;
+    g_flashAt = g_time;
+    g_thunderAt = g_time + 0.4 + dist * 0.02;
+}
+static void HideBolt() {
+    for (int i = 0; i < 7; i++) Show(g_bolt[i], false);
+}
+static void StormTick(Vector3 hp) {
+    EnsureStorm();
+    if (g_nextBolt == 0) g_nextBolt = g_time + 2.0 + Rand01() * 3.0;
+    if (g_time >= g_nextBolt && Alive(g_bolt[0].get())) {
+        StrikeBolt(hp);
+        g_nextBolt = g_time + 5.0 + Rand01() * 7.0;               // one strike every 5-12 seconds
+    }
+    if (g_boltHideAt > 0 && g_time >= g_boltHideAt) { HideBolt(); g_boltHideAt = 0; }
+    Il2CppObject *l = g_wxLight.get();
+    if (Alive(l) && g_lightIntensity.IsValid()) {              // a dim flash that fades, with a small flicker
+        float t = (float)(g_time - g_flashAt);
+        float k = g_flashAt > 0 && t < 0.4f ? 1.0f - t / 0.4f : 0.0f;
+        if (t > 0.12f && t < 0.2f) k *= 0.3f;
+        G.behaviourSetEnabled[l](k > 0);
+        if (k > 0) {
+            G.trSetPosition[Tr(G.compGameObject[l]())](hp + Vector3(0, 5.0f, 0));
+            g_lightIntensity[l](9.0f * k);
+        }
+    }
+    if (g_thunderAt > 0 && g_time >= g_thunderAt) { PlayThunder(); g_thunderAt = 0; }
+}
+
+static void WeatherOff() {
+    g_wxOn = false;
+    g_fxMode = -1;
+    g_nextBolt = 0;
+    g_thunderAt = 0;
+    g_boltHideAt = 0;
+    g_flashAt = 0;
+    Show(g_wxRoot, false);                                     // hides every piece; they are reused next time
+    if (Alive(g_wxLight.get())) G.behaviourSetEnabled[g_wxLight.get()](false);
+    if (Alive(g_wxAudioSrc.get()) && G.asStop.IsValid()) G.asStop[g_wxAudioSrc.get()]();
+    HideBolt();
+}
+static void WeatherReset() {                                   // room change: the old objects are gone
+    Kill(g_wxRoot);
+    Kill(g_wxAudioGo);
+    Kill(g_wxClip);
+    for (int i = 0; i < kMaxFx; i++) { g_fx[i].clear(); g_fxT[i].clear(); }
+    for (int i = 0; i < 7; i++) g_bolt[i].clear();
+    g_wxLight.clear();
+    g_wxAudioSrc.clear();
+    g_fxMade = 0; g_fxMode = -1; g_fxShown = -1;
+    g_nextBolt = g_thunderAt = g_boltHideAt = g_flashAt = 0;
+    g_wxOn = false;
+}
+
+static void WeatherTick(float dt) {
+    int mode = (g_wx >= 0 && g_wxSel[g_wx]) ? g_wx : -1;
+    Il2CppObject *head = g_head.get();
+    if (mode < 0 || !head) { if (g_wxOn) WeatherOff(); return; }
+    if (!EnsureWxRoot()) return;
+    if (!g_wxOn) { g_wxOn = true; Show(g_wxRoot, true); }
+    Vector3 hp = G.trGetPosition[head]();
+    if (g_time >= g_nextGround) {                              // ground height, four times a second
+        g_nextGround = g_time + 0.25;
+        int mask = G.locomotionLayers.IsValid() && g_player.get() ? G.locomotionLayers[g_player.get()]() : -5;
+        BNM::Structures::Unity::RaycastHit hit{};
+        bool found = G.raycast.IsValid() && G.raycast(hp, Vector3(0, -1, 0), &hit, 8.0f, mask ? mask : -5);
+        g_groundY = found ? hit.point.y : hp.y - 2.5f;
+    }
+    int want = kFxCounts[mode][g_wxIntensity];
+    for (int n = 0; n < 25 && g_fxMade < kMaxFx; n++) {        // make the pool a few pieces per frame
+        Il2CppObject *o = Prim(3, Color(1, 1, 1, 1), false);
+        if (!o) break;
+        int i = g_fxMade++;
+        Il2CppObject *t = Tr(o);
+        G.trSetParent[t](Tr(g_wxRoot.get()), false);
+        g_fx[i].set(o);
+        g_fxT[i].set(t);
+        StyleFx(i, mode);
+        RespawnFx(i, hp, true);
+        G.goSetActive[o](i < want);
+    }
+    if (g_fxMade == 0) return;
+    if (mode != g_fxMode) {                                    // switched effect: restyle and refill the air
+        g_fxMode = mode;
+        for (int i = 0; i < g_fxMade; i++) { StyleFx(i, mode); RespawnFx(i, hp, true); }
+        g_fxShown = -1;
+    }
+    if (want != g_fxShown) {
+        for (int i = 0; i < g_fxMade; i++) if (Alive(g_fx[i].get())) G.goSetActive[g_fx[i].get()](i < want);
+        g_fxShown = want;
+    }
+    int active = std::min(want, g_fxMade);
+    float t = (float)g_time;
+    for (int i = 0; i < active; i++) {
+        Vector3 &p = g_fxPos[i];
+        if (mode == 0) {                                       // snow: slow, swaying
+            p.y -= 1.1f * dt;
+            p.x += sinf(t * 1.1f + g_fxPhase[i]) * 0.35f * dt;
+            p.z += cosf(t * 0.9f + g_fxPhase[i]) * 0.35f * dt;
+        } else {                                               // rain: fast, a little wind
+            p.y -= 9.0f * dt;
+            p.x += 0.6f * dt;
+        }
+        float dx = p.x - hp.x, dz = p.z - hp.z;
+        if (p.y < g_groundY || dx * dx + dz * dz > 25.0f) RespawnFx(i, hp, false);
+        if (Il2CppObject *tr = g_fxT[i].get()) G.trSetPosition[tr](p);
+    }
+    if (mode == 2) StormTick(hp);
+    else { HideBolt(); g_nextBolt = 0; }
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
@@ -1697,6 +2054,7 @@ static void OnRoomChange() {
     PauseTrackers(false);
     g_dancing = false;
     g_gunLine.clear();
+    WeatherReset();
     if (g_noclipOn && g_player.get()) {           // leaving the room mid-noclip: put things back
         Buttons none;                             // trigger "released"
         NoclipTick(none);
@@ -1752,6 +2110,8 @@ static void OnUpdate(float dt) {
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
     try { LoadTick(); }
     catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
+    try { WeatherTick(dt); }
+    catch (...) { WeatherOff(); g_wx = -1; for (bool &b : g_wxSel) b = false; ym::log("clientdabell: effects error, turned off"); }
     DanceTick(in, dt);              // last: it moves your hands after everything else
 }
 
